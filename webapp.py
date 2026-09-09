@@ -280,19 +280,20 @@ $('#copy_text').onclick = async () => {
   }
 };
 
-/* 图片出口：桌面=复制到剪贴板；Android=系统分享面板(可选QQ直达)；其余=下载 */
+/* 图片出口：桌面=复制到剪贴板（Ctrl+V 贴图）；手机/其它=保存长图
+   注：手机 QQ 频道的输入框只能从“相册”选图，无法粘贴剪贴板图片，
+   因此移动端不做系统分享面板（分享目标里也没有 QQ 频道） */
 $('#copy_img').onclick = async () => {
   const img = $('#preview_img');
-  if(!curKey){toast('还没有可分享的图片');return;}
+  if(!curKey){toast('还没有可保存的图片');return;}
   let blob;
   try{ blob = await (await fetch(img.src)).blob(); }catch(e){ toast('获取图片失败'); return; }
 
   const canClip = !!navigator.clipboard && !!window.ClipboardItem && !!navigator.clipboard.write;
-  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-  const isAndroid = /Android/.test(navigator.userAgent);
+  const isMobile = IS_MOBILE;
 
   // 1) 桌面/支持 ClipboardItem：写入剪贴板（QQ 桌面 Ctrl+V 贴图）
-  if(canClip && !isAndroid && !isIOS){
+  if(canClip && !isMobile){
     try{
       await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
       flash($('#copy_img'),'✅ 图片已复制');
@@ -301,26 +302,18 @@ $('#copy_img').onclick = async () => {
     }catch(e){ /* 落到下面兜底 */ }
   }
 
-  // 2) 移动端优先走系统分享面板（可直接选 QQ 发送）
-  if(navigator.canShare && navigator.share){
-    const file = new File([blob], 'yingtie_share.png', {type:'image/png'});
-    try{
-      await navigator.share({files:[file], title:curKey});
-      return; // 分享面板已打开
-    }catch(e){ if(e && e.name==='AbortError') return; /* 用户取消不算错 */ }
-  }
-
-  // 3) 最终兜底：下载 PNG（电脑可另存/拖入 QQ，手机可保存相册再发）
+  // 2) 下载 PNG（电脑可另存/拖入 QQ；手机存入下载目录）
   try{
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = curKey + '.png';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(url), 4000);
-    flash($('#copy_img'),'✅ 长图已下载');
-    toast((isAndroid||isIOS) ? '已开始下载长图，保存后到 QQ 里发送图片即可'
-                              : '已下载长图，可直接拖进 QQ 或右键复制');
-  }catch(e){ toast('分享失败：请长按图片保存/分享'); }
+    flash($('#copy_img'),'✅ 长图已保存');
+    toast(isMobile
+      ? '长图已保存。更推荐：长按图片 → “保存图片”（直接进相册），再到 QQ 频道输入框 ⊕ 相册选择发送'
+      : '长图已下载，可直接拖进 QQ 或右键复制图片');
+  }catch(e){ toast('保存失败：请长按图片 → “保存图片”'); }
 };
 
 function flash(btn,msg,err){
@@ -347,12 +340,11 @@ const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
   const ver = m ? parseInt(m[2], 10) : 0;
   const legacy = !!document.execCommand;
 
-  // 移动端按钮文案与提示
+  // 移动端：QQ 频道只能从相册发图，给出正确引导
   if (IS_MOBILE) {
-    $('#copy_img').innerHTML = IS_MOBILE && /Android/.test(navigator.userAgent)
-      ? '📤 分享长图' : '⬇ 保存长图';
+    $('#copy_img').innerHTML = '⬇ 保存长图';
     cap.className = 'cap good';
-    cap.innerHTML = '<b>✔ 手机模式</b> —— 点“' + $('#copy_img').textContent.trim() + '”可把长图发到 QQ（Android 走系统分享面板可直接选 QQ）；文本点“复制文本”后到 QQ 输入框粘贴。';
+    cap.innerHTML = '<b>📱 手机发 QQ 频道</b><br>① <b>文本</b>：点“复制文本”后，到频道输入框长按 → 粘贴；<br>② <b>长图</b>：<b>长按上图 → “保存图片”</b>（存入相册），再到频道输入框 ⊕ 相册 → 选择该图发送。<br><span style="color:#8a919f">QQ 频道不支持粘贴剪贴板图片，相册是必经一步。</span>';
     cap.style.display = 'block';
     return;
   }
