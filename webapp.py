@@ -40,6 +40,9 @@ def index():
 def api_generate():
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("text") or "").strip()
+    mode = data.get("mode") or "long"
+    if mode not in ("long", "poster", "none"):
+        mode = "long"
     if not text:
         return jsonify({"ok": False, "error": "请先粘贴分享链接/文本"})
 
@@ -47,7 +50,8 @@ def api_generate():
         text,
         quality=(data.get("quality") or "").strip() or None,
         size=(data.get("size") or "").strip() or None,
-        include_image=True,
+        include_image=(mode != "none"),
+        image_mode=mode,
         width=760,
         font_size=28,
         verbose=False,
@@ -55,11 +59,16 @@ def api_generate():
     if not res["ok"]:
         return jsonify({"ok": False, "error": res["error"]})
 
-    key = None
-    if res.get("image_b64"):
-        key = res["title"] or "share"
-        with _CACHE_LOCK:
-            RESULT_CACHE[key] = res["image_b64"]
+    # 选择前端要展示的主图：根据 mode 取对应 base64
+    primary_b64 = ""
+    primary_mime = "image/png"
+    if mode == "long":
+        primary_b64 = res.get("image_b64", "")
+        primary_mime = "image/png"
+    elif mode == "poster":
+        primary_b64 = res.get("cover_b64") or res.get("poster_jpg_b64", "")
+        primary_mime = "image/jpeg"
+    # 复制按钮剪贴板需要 PNG，前端再用 canvas 转
 
     return jsonify({
         "ok": True,
@@ -67,7 +76,10 @@ def api_generate():
         "title": res["title"],
         "cloud": res.get("cloud", ""),
         "manual": res.get("manual", False),
-        "image_key": key,
+        "collection": res.get("collection", False),
+        "mode": mode,
+        "primary_b64": primary_b64,
+        "primary_mime": primary_mime,
         "hint": _size_hint(res.get("text")),
     })
 
@@ -183,7 +195,14 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="row">
       <span class="tips">画质/大小留空则按分享体积自动推断</span>
-      <button class="btn primary" id="go">✨ 生成帖子</button>
+      <div style="display:flex;align-items:center;gap:10px">
+        <select id="mode" style="border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:13px;background:#fff;outline:none">
+          <option value="long">长图(默认)</option>
+          <option value="poster">仅海报/封面(&lt;500KB)</option>
+          <option value="none">纯文本</option>
+        </select>
+        <button class="btn primary" id="go">✨ 生成帖子</button>
+      </div>
     </div>
   </div>
 
@@ -205,20 +224,20 @@ PAGE = r"""<!doctype html>
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" id="img_section">
       <div class="row" style="margin-top:0">
-        <label style="margin:0;font-size:14px;font-weight:600;color:var(--ink)">发帖长图（封面 + 字段 + 下载地址）</label>
+        <label style="margin:0;font-size:14px;font-weight:600;color:var(--ink)">图片（长图 / 海报·封面，自动 <500KB）</label>
         <button class="btn blue" id="copy_img">🖼 复制图片</button>
       </div>
-      <img id="preview_img" class="preview" style="margin-top:14px" alt="长图预览">
-      <div class="meta" style="margin-top:10px">
-        复制图片后，到 QQ 桌面版频道输入框里 <b>Ctrl+V</b> 直接粘贴为图片
-        <span class="badge">需 Chrome/Edge + localhost</span>
+      <img id="preview_img" class="preview" style="margin-top:14px" alt="预览">
+      <div class="meta" style="margin-top:10px" id="img_hint">
+        <b>长图模式</b>：复制图片后到 QQ 桌面版 <b>Ctrl+V</b> 粘贴为图<br>
+        <b>海报模式</b>：点按钮复制到剪贴板（移动端会保存到下载目录，再长按图存相册）
       </div>
     </div>
   </div>
 
-  <footer>生成结果仅保存在本机。图片粘贴功能依赖浏览器 Clipboard API（localhost 安全上下文）。</footer>
+  <footer>生成结果仅保存在本机。海报/封面压缩到 500KB 以内，复制图片功能依赖浏览器 Clipboard API（localhost / HTTPS 安全上下文）。</footer>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -226,6 +245,7 @@ PAGE = r"""<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 let curKey = null;
+let curMode = "long";
 
 function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');
   clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2600);}
@@ -233,26 +253,45 @@ function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show'
 $('#go').onclick = async () => {
   const text = $('#in').value.trim();
   if(!text){toast('请先粘贴分享链接');return;}
+  curMode = $('#mode').value || "long";
   $('#go').disabled = true;
   $('#loading').classList.remove('hidden');
   $('#result').classList.add('hidden');
   try{
     const resp = await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text, quality:$('#quality').value, size:$('#size').value})});
+      body:JSON.stringify({text, quality:$('#quality').value, size:$('#size').value, mode:curMode})});
     const d = await resp.json();
     if(!d.ok){toast(d.error||'生成失败');return;}
-    curKey = d.image_key;
+    curMode = d.mode;
+    curKey = d.title;
     $('#out_text').textContent = d.text;
-    $('#title_line').textContent = '🎬 ' + d.title + (d.cloud?('　·　来源 ' + d.cloud):'');
-    if(d.manual){$('#title_line').textContent += '（自动资料缺失，已按标题生成）';}
-    if(curKey){
-      $('#preview_img').src = '/image/' + encodeURIComponent(curKey) + '?t=' + Date.now();
+    let titleTxt = '🎬 ' + d.title + (d.cloud?('　·　来源 ' + d.cloud):'');
+    if(d.collection) titleTxt += '　·　合集';
+    if(d.manual)    titleTxt += '（自动资料缺失，已按标题生成）';
+    $('#title_line').textContent = titleTxt;
+
+    const img = $('#preview_img');
+    if(d.primary_b64){
+      img.src = 'data:' + d.primary_mime + ';base64,' + d.primary_b64;
+    }else{
+      img.removeAttribute('src');
     }
+    // 显示与按钮提示
+    const imgSection = $('#img_section');
+    if(curMode === 'none') imgSection.classList.add('hidden'); else imgSection.classList.remove('hidden');
+    const copyBtn = $('#copy_img');
+    if(curMode === 'long') copyBtn.textContent = '🖼 复制图片';
+    else if(curMode === 'poster'){
+      copyBtn.textContent = canShareFiles() ? '🖼 复制海报' : '⬇ 保存海报';
+    }else copyBtn.textContent = '图片';
+
     $('#result').classList.remove('hidden');
     $('#result').scrollIntoView({behavior:'smooth'});
   }catch(e){toast('请求失败：'+e);}
   finally{$('#go').disabled=false;$('#loading').classList.add('hidden');}
 };
+
+function canShareFiles(){return !!(navigator.canShare && navigator.share && /Android/i.test(navigator.userAgent));}
 
 /* 复制文本：Clipboard API → 老 execCommand 双保险
    （公网 http 非安全上下文下 writeText 可能被拒，execCommand 仍可用） */
@@ -280,40 +319,67 @@ $('#copy_text').onclick = async () => {
   }
 };
 
-/* 图片出口：桌面=复制到剪贴板（Ctrl+V 贴图）；手机/其它=保存长图
-   注：手机 QQ 频道的输入框只能从“相册”选图，无法粘贴剪贴板图片，
-   因此移动端不做系统分享面板（分享目标里也没有 QQ 频道） */
+/* 复制图片：根据当前 mode 走不同路径
+   - long：PNG 直接写剪贴板（QQ 桌面 Ctrl+V 贴图）
+   - poster：把已显示的海报/JPG 用 canvas 转 PNG 后写剪贴板
+   - none：按钮已隐藏 */
 $('#copy_img').onclick = async () => {
+  if(curMode === 'none') return;
   const img = $('#preview_img');
-  if(!curKey){toast('还没有可保存的图片');return;}
-  let blob;
-  try{ blob = await (await fetch(img.src)).blob(); }catch(e){ toast('获取图片失败'); return; }
+  if(!img || !img.src){ toast('还没有可复制的图片'); return; }
 
-  const canClip = !!navigator.clipboard && !!window.ClipboardItem && !!navigator.clipboard.write;
-  const isMobile = IS_MOBILE;
+  // 桌面 + 能写 PNG 剪贴板 → 走 ClipboardItem
+  const canClipPng = !!navigator.clipboard && !!window.ClipboardItem &&
+                     !!navigator.clipboard.write &&
+                     !/Android|iPhone|iPad|iPod/.test(navigator.userAgent);
 
-  // 1) 桌面/支持 ClipboardItem：写入剪贴板（QQ 桌面 Ctrl+V 贴图）
-  if(canClip && !isMobile){
+  // poster 模式：先把显示图转为 PNG Blob（剪贴板要求 PNG）
+  if(curMode === 'poster'){
     try{
+      // 等图加载完
+      if(!img.complete){ await new Promise(r => img.onload = r); }
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      c.getContext('2d').drawImage(img, 0, 0);
+      const pngBlob = await new Promise(r => c.toBlob(r, 'image/png'));
+      if(canClipPng){
+        await navigator.clipboard.write([new ClipboardItem({'image/png': pngBlob})]);
+        flash($('#copy_img'),'✅ 海报已复制');
+        toast('海报已复制，去 QQ 桌面版 Ctrl+V 粘贴'); return;
+      }
+      // 移动或不支持：下载保存
+      const url = URL.createObjectURL(pngBlob);
+      const a = document.createElement('a');
+      a.href = url; a.download = (curKey || 'poster') + '.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 4000);
+      flash($('#copy_img'),'✅ 已保存');
+      toast('海报已保存，可长按图→保存到相册，再到频道输入框 ⊕ 相册发送');
+    }catch(e){ toast('复制失败，请长按图片保存'); }
+    return;
+  }
+
+  // long 模式（与 v1.0.x 相同）
+  if(canClipPng){
+    try{
+      const blob = await (await fetch(img.src)).blob();
       await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
       flash($('#copy_img'),'✅ 图片已复制');
       toast('图片已在剪贴板，去 QQ 桌面版 Ctrl+V 粘贴');
       return;
-    }catch(e){ /* 落到下面兜底 */ }
+    }catch(e){}
   }
-
-  // 2) 下载 PNG（电脑可另存/拖入 QQ；手机存入下载目录）
+  // 兜底：保存
   try{
+    const blob = await (await fetch(img.src)).blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = curKey + '.png';
+    a.href = url; a.download = (curKey || 'long_image') + '.png';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(url), 4000);
-    flash($('#copy_img'),'✅ 长图已保存');
-    toast(isMobile
-      ? '长图已保存。更推荐：长按图片 → “保存图片”（直接进相册），再到 QQ 频道输入框 ⊕ 相册选择发送'
-      : '长图已下载，可直接拖进 QQ 或右键复制图片');
-  }catch(e){ toast('保存失败：请长按图片 → “保存图片”'); }
+    flash($('#copy_img'),'✅ 已保存');
+    toast('长图已下载，可直接拖进 QQ 或右键复制图片');
+  }catch(e){ toast('失败：请右键图片保存'); }
 };
 
 function flash(btn,msg,err){
