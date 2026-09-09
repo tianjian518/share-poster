@@ -280,21 +280,47 @@ $('#copy_text').onclick = async () => {
   }
 };
 
-/* 把长图以 PNG 写入系统剪贴板 —— QQ Ctrl+V 直接粘贴成图 */
+/* 图片出口：桌面=复制到剪贴板；Android=系统分享面板(可选QQ直达)；其余=下载 */
 $('#copy_img').onclick = async () => {
   const img = $('#preview_img');
-  if(!curKey){toast('还没有可复制的图片');return;}
-  try{
-    const blob = await (await fetch(img.src)).blob();
-    await navigator.clipboard.write([
-      new ClipboardItem({'image/png': blob})
-    ]);
-    flash($('#copy_img'),'✅ 图片已复制');
-    toast('图片已在剪贴板，去 QQ 桌面版频道 Ctrl+V 粘贴');
-  }catch(e){
-    flash($('#copy_img'),'⚠ 复制受限',true);
-    toast('当前浏览器不支持复制图片，可右键图片“另存为”或直接截图。建议用 Chrome/Edge 访问 http://127.0.0.1 使用');
+  if(!curKey){toast('还没有可分享的图片');return;}
+  let blob;
+  try{ blob = await (await fetch(img.src)).blob(); }catch(e){ toast('获取图片失败'); return; }
+
+  const canClip = !!navigator.clipboard && !!window.ClipboardItem && !!navigator.clipboard.write;
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const isAndroid = /Android/.test(navigator.userAgent);
+
+  // 1) 桌面/支持 ClipboardItem：写入剪贴板（QQ 桌面 Ctrl+V 贴图）
+  if(canClip && !isAndroid && !isIOS){
+    try{
+      await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
+      flash($('#copy_img'),'✅ 图片已复制');
+      toast('图片已在剪贴板，去 QQ 桌面版 Ctrl+V 粘贴');
+      return;
+    }catch(e){ /* 落到下面兜底 */ }
   }
+
+  // 2) 移动端优先走系统分享面板（可直接选 QQ 发送）
+  if(navigator.canShare && navigator.share){
+    const file = new File([blob], 'yingtie_share.png', {type:'image/png'});
+    try{
+      await navigator.share({files:[file], title:curKey});
+      return; // 分享面板已打开
+    }catch(e){ if(e && e.name==='AbortError') return; /* 用户取消不算错 */ }
+  }
+
+  // 3) 最终兜底：下载 PNG（电脑可另存/拖入 QQ，手机可保存相册再发）
+  try{
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = curKey + '.png';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 4000);
+    flash($('#copy_img'),'✅ 长图已下载');
+    toast((isAndroid||isIOS) ? '已开始下载长图，保存后到 QQ 里发送图片即可'
+                              : '已下载长图，可直接拖进 QQ 或右键复制');
+  }catch(e){ toast('分享失败：请长按图片保存/分享'); }
 };
 
 function flash(btn,msg,err){
@@ -305,6 +331,9 @@ function flash(btn,msg,err){
 }
 
 $('#in').value = ''; // 保持清爽
+
+/* 移动端判断：用于能力提示与按钮文案 */
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 
 /* 浏览器能力自检：决定能不能"复制图片到剪贴板" */
 (function capabilityCheck(){
@@ -317,6 +346,16 @@ $('#in').value = ''; // 保持清爽
   const m = ua.match(/Chrom(e|ium)\/(\d+)/) || ua.match(/CriOS\/(\d+)/);
   const ver = m ? parseInt(m[2], 10) : 0;
   const legacy = !!document.execCommand;
+
+  // 移动端按钮文案与提示
+  if (IS_MOBILE) {
+    $('#copy_img').innerHTML = IS_MOBILE && /Android/.test(navigator.userAgent)
+      ? '📤 分享长图' : '⬇ 保存长图';
+    cap.className = 'cap good';
+    cap.innerHTML = '<b>✔ 手机模式</b> —— 点“' + $('#copy_img').textContent.trim() + '”可把长图发到 QQ（Android 走系统分享面板可直接选 QQ）；文本点“复制文本”后到 QQ 输入框粘贴。';
+    cap.style.display = 'block';
+    return;
+  }
 
   if (canAPI && secure) {
     cap.className = 'cap good';

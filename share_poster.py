@@ -44,7 +44,7 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
