@@ -44,7 +44,7 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
@@ -266,17 +266,34 @@ class CloudShareFetcher:
         result["size_bytes"] = info.get("totalFileSize") or 0
         result["file_count"] = info.get("totalFileNum") or 0
         result["share_id"] = share_id
+        result["files"] = []      # 顶层
+        result["deep_files"] = []  # 递归展开后的叶子文件（视频/资源文件）
 
-        # 顺带拉第一层文件列表（可能有更多文件名线索）
+        # 递归列出目录：分享里常是「合集文件夹」套多层子文件夹
         try:
             token = self._post_json("get_share_access_token", {"shareId": share_id})["accessToken"]
-            fl = self._post_json("get_share_page_files_list", {
+            root = self._post_json("get_share_page_files_list", {
                 "pageSize": 100, "accessToken": token,
                 "orderBy": 0, "sortType": 0, "parentId": "",
             })
-            result["files"] = fl.get("list") or []
+            result["files"] = root.get("list") or []
+            leaves, budget = [], 60
+            stack = [(f, 0) for f in reversed(result["files"])]
+            while stack and budget > 0:
+                node, depth = stack.pop()
+                budget -= 1
+                if node.get("dirType") == 1 and depth < 3:
+                    sub = self._post_json("get_share_page_files_list", {
+                        "pageSize": 100, "accessToken": token,
+                        "orderBy": 0, "sortType": 0, "parentId": node.get("fileId"),
+                    })
+                    for ch in reversed(sub.get("list") or []):
+                        stack.append((ch, depth + 1))
+                elif node.get("dirType") != 1:
+                    leaves.append(node)
+            result["deep_files"] = leaves
         except Exception:
-            result["files"] = []
+            result["files"] = result.get("files") or []
         return result
 
 
@@ -866,6 +883,48 @@ def main():
     if not raw_name:
         raw_name = args.title or ""
 
+    # 3.5 合集分支：分享目录里递归列出多部不同影片 → 直接出合集帖
+    if not args.title:
+        items = collect_media_items(page_meta.get("deep_files") if page_meta else None)
+        if len(items) >= 2:
+            print(f"\n🧩 检测到合集（{len(items)} 部）")
+            for it in items[:6]:
+                print(f"   - {it['title']} {('(' + str(it['year']) + ')') if it.get('year') else ''}"
+                      f"{(' [tmdb-' + it['tmdb'] + ']') if it.get('tmdb') else ''}"
+                      f"{(' [' + it['quality'] + ']') if it.get('quality') else ''}")
+            if len(items) > 6:
+                print(f"   … 其余 {len(items) - 6} 部")
+            collection_text = build_collection_text(
+                share, raw_name or "影视合集", items,
+                quality=args.quality,   # 用户显式指定优先，否则从文件名推断
+                size=args.size or human_size(page_meta.get("size_bytes")),
+                synopsis=args.synopsis,
+            )
+            # 输出合集结果
+            print("\n" + "─" * 56)
+            print(collection_text)
+            print("─" * 56 + "\n")
+            out_dir = Path(args.output_dir).expanduser()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r"[^\w\-\u4e00-\u9fa5]", "_", raw_name or "合集")[:50]
+            txt_path = out_dir / f"{safe}_share.txt"
+            txt_path.write_text(collection_text, encoding="utf-8")
+            print(f"📄 文本已保存:{txt_path}")
+            if args.make_image:
+                try:
+                    maker = PosterMaker(width=args.image_width, font_size=args.font_size)
+                    img = maker.render(collection_text, None,
+                                       title=(raw_name or "影视合集"))
+                    img_path = out_dir / f"{safe}_share.jpg"
+                    img.save(img_path, quality=92)
+                    print(f"🖼  长图已保存:{img_path}")
+                except Exception as e:
+                    sys.stderr.write(f"[生成图片失败] {e}\n")
+            if api_key and (args.save_config or not cfg.get("tmdb_api_key")):
+                save_config({**cfg, "tmdb_api_key": api_key})
+            print("\n完成 ✅")
+            return
+
     # 4. 采集影视信息
     info = {"_manual": True}
     poster_img = None
@@ -1002,6 +1061,155 @@ def main():
     print("\n完成 ✅")
 
 
+# --- 合集识别与处理 ----------------------------------------------------
+# 分享里常见的资源形态：
+#   单部：1 个视频文件（可带字幕/封面）→ 现有单部流程
+#   合集：多部不同影片（周星驰合集 / 黑客帝国1-4 / 指环王三部曲）→ 本组函数
+# 子文件名通常形如：黑客帝国 (1999) {tmdb-603} [1080p H.265].mkv
+
+NON_MEDIA_EXTS = {".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".lrc",
+                  ".txt", ".nfo", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}
+MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv",
+              ".flv", ".rmvb", ".m4v", ".webm", ".iso", ".bdmv"}
+
+
+def parse_quality_from_name(name):
+    """从文件名提取画质标签，如 [1080p H.265 DD 2.0] → '1080P HEVC'"""
+    lo = name.lower()
+    tags = []
+    if re.search(r"\b(2160p|4k|uhd|8k)\b", lo):
+        tags.append("2160P")
+    elif re.search(r"\b1080p\b", lo):
+        tags.append("1080P")
+    elif re.search(r"\b720p\b", lo):
+        tags.append("720P")
+    if re.search(r"\b(hevc|h[-_. ]?265|x265)\b", lo):
+        tags.append("HEVC")
+    elif re.search(r"\b(h[-_. ]?264|avc|x264)\b", lo):
+        tags.append("H.264")
+    if re.search(r"\bremux\b", lo):
+        tags.append("REMUX")
+    elif re.search(r"\b(bluray|bdrip|蓝光原盘)\b", lo):
+        tags.append("蓝光")
+    elif re.search(r"\bweb[-_. ]?dl\b", lo):
+        tags.append("WEB-DL")
+    elif re.search(r"\bwebrip\b", lo):
+        tags.append("WEBRip")
+    if re.search(r"\b(dvdr?|dvdrip)\b", lo):
+        tags.append("DVD")
+    if re.search(r"\bhdr10?\+?\b|\b(dv|dolby.?vision)\b", lo):
+        tags.append("HDR")
+    return " ".join(tags) if tags else ""
+
+
+def collect_media_items(deep_files):
+    """把递归列出的文件整理成影视条目（去重：同片不同后缀/分卷只算一个）。
+    返回 [{file, name, title, year, tmdb, quality, ext, size}]，已按年份排序。
+    过滤掉字幕 / 封面 / 文本等附属文件。
+    """
+    raw = []
+    for f in deep_files or []:
+        name = (f.get("fileName") or "").strip()
+        ext = Path(name).suffix.lower()
+        if ext not in MEDIA_EXTS:
+            continue
+        base = Path(name).stem
+        # 同片分卷：名字主体去掉 part/cd/disc/分卷 数字后再归并
+        key = re.sub(r"[-_ .]?(part|cd|disc|pt|vol|分卷|上下)?[-_ .]?\d{1,2}$", "", base, flags=re.I)
+        t, year, tmdb = parse_share_title(base)
+        raw.append({
+            "file": name, "ext": ext, "size": f.get("size") or 0,
+            "quality": parse_quality_from_name(name),
+            "key": key.lower(), "title": t or base,
+            "year": int(year) if (year or "").isdigit() else None,
+            "tmdb": tmdb,
+        })
+    # 去重：同一 (key, year)
+    seen, items = {}, []
+    for it in raw:
+        uid = (it["key"], it["year"])
+        if uid in seen:
+            old = seen[uid]
+            old["ext"] = old["ext"] + "+" + it["ext"]
+            if not old["quality"]:
+                old["quality"] = it["quality"]
+            continue
+        seen[uid] = it
+        items.append(it)
+    items.sort(key=lambda x: (x["year"] or 9999, x["title"]))
+    return items
+
+
+def is_collection_title(name):
+    """标题里是否带明显的合集信号（含单部标题里的合集描述词）"""
+    if not name:
+        return False
+    return bool(re.search(r"合集|合辑|全集|全季|系列|三部曲|四部曲|五部曲|"
+                          r"打包|收藏版|\d\s*[-—~至]\s*\d|一至|1\s*[-—~]\s*4\b", name))
+
+
+def _quality_mix(items):
+    """合集画质推断：全一致用该标签；分辨率混搭显示“1080P/2160P 混合”"""
+    qs = [i["quality"] for i in items if i.get("quality")]
+    if not qs:
+        return ""
+    if len(set(qs)) == 1:
+        return qs[0]
+
+    def res(q):
+        return ("2160P" if "2160" in q else "1080P" if "1080" in q
+                else "720P" if "720" in q else "4K" if "4K" in q else "HD")
+    reses = sorted({res(q) for q in qs})
+    if len(reses) > 1:
+        return "/".join(reses) + " 混合"
+    return qs[0]
+
+
+def build_collection_text(share, series_name, items, quality=None, size=None, synopsis=None):
+    """生成合集分享帖文本。quality 缺省时优先取子文件里统一的画质标签。"""
+    if not quality:
+        quality = _quality_mix(items) or "1080P"
+    size = size or "未知大小"
+    years = sorted({i["year"] for i in items if i["year"]})
+    span = ""
+    if len(years) >= 2 and years[-1] - years[0] > 0:
+        span = f" ({years[0]}-{years[-1]})"
+    elif len(years) == 1:
+        span = f" ({years[0]})"
+
+    E = PostGenerator.EMOJI
+    lines = [f"{E['title']} 名称:{series_name}{span}"]
+    lines.append(f"{E['quality']} 质量:{quality} [{size}]")
+    lines.append(f"{E['episodes']} 集数:共 {len(items)} 部")
+
+    # 片单
+    shown = 0
+    for it in items:
+        shown += 1
+        if shown > 15:
+            lines.append(f"    …其余 {len(items) - shown + 1} 部见分享目录")
+            break
+        tag = it["quality"]
+        tm = f" {{tmdb-{it['tmdb']}}}" if it.get("tmdb") else ""
+        y = f" ({it['year']})" if it.get("year") else ""
+        lines.append(f"   {shown}.{it['title']}{y}{tm}"
+                     + (f" [{tag}]" if tag else ""))
+
+    if synopsis:
+        syn = synopsis.strip().replace("\n", " ")
+        lines.append(f"{E['synopsis']} 简介:{syn}")
+    else:
+        lines.append(f"{E['synopsis']} 简介:收录 {len(items)} 部完整影视文件，明细见上方片单")
+
+    lines.append(f"{E['download']} 下载地址:")
+    lines.append(share["url"])
+    if share.get("code"):
+        lines.append(f"\n提取码: {share['code']}")
+    if share.get("cloud"):
+        lines.append(f"（来源:{share['cloud']}）")
+    return "\n".join(lines)
+
+
 # --- 一键生成（供 CLI / Web 复用） --------------------------------------
 def generate(share_text, quality=None, size=None, title=None, pick=1,
              include_image=True, width=720, font_size=28,
@@ -1052,6 +1260,41 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
         if raw_name:
             log(f"  片名: {raw_name} {('(' + share_year + ')') if share_year else ''}"
                 f"{('  [tmdb-' + tmdb_id + ']') if tmdb_id else ''}")
+
+    # ===== 合集分支：递归列出的文件里有多部不同影片 =====
+    items = collect_media_items(page_meta.get("deep_files") if page_meta else None)
+    if len(items) >= 2 and not title:
+        log(f"\n🧩 检测到合集（{len(items)} 部）")
+        for it in items[:8]:
+            log(f"   - {it['title']} {('(' + str(it['year']) + ')') if it.get('year') else ''}"
+                f"{(' [tmdb-' + it['tmdb'] + ']') if it.get('tmdb') else ''}"
+                f"{(' [' + it['quality'] + ']') if it.get('quality') else ''}")
+        if len(items) > 8:
+            log(f"   … 其余 {len(items) - 8} 部")
+        series = raw_name or "影视合集"
+        text = build_collection_text(
+            share, series or "影视合集", items,
+            quality=None,
+            size=size or human_size(page_meta.get("size_bytes")),
+        )
+        result["text"] = text
+        result["title"] = series or "影视合集"
+        result["collection"] = True
+        log("\n" + "─" * 56)
+        log(text)
+        log("─" * 56 + "\n")
+        if include_image:
+            try:
+                maker = PosterMaker(width=width, font_size=font_size)
+                img = maker.render(text, None, title=result["title"])
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                import base64
+                result["image_b64"] = base64.b64encode(buf.getvalue()).decode()
+            except Exception as e:
+                log(f"  ⚠ 合集长图生成失败: {e}")
+        result["ok"] = True
+        return result
 
     # 采集影视信息
     info = {"_manual": True}
