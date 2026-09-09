@@ -1,0 +1,30 @@
+services:
+  webapp:
+    # 构建上下文指向仓库根目录（Dockerfile、share_poster.py、webapp.py 都在仓库根）
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: share-poster-web:latest
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    # 只在 Docker 内网暴露即可，不需要映射到宿主机公网
+    expose:
+      - "8321"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - webapp
+
+volumes:
+  caddy_data:
+  caddy_config:

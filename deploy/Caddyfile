@@ -1,0 +1,6 @@
+# Caddy 自动申请/续期 Let's Encrypt 证书，并把 https 流量转发给 webapp 容器
+# 把下一行 your-domain.com 换成你自己的域名（需先把域名 A 记录指向服务器公网 IP）
+your-domain.com {
+    encode gzip
+    reverse_proxy webapp:8321
+}
