@@ -44,7 +44,7 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
@@ -282,7 +282,8 @@ class CloudShareFetcher:
 
 # --- TMDB 免 Key 网页抓取 ---------------------------------------------
 # TMDB 官网公开页面包含结构化数据（og: 标签 + JSON-LD），无需 API Key。
-# 我们请求 zh-CN 页面拿到中文片名 / 简介 / 演员 / 海报。
+# 注意：TMDB 网页语言由 Accept-Language 头决定（与访问者 IP/geo 无关），
+# 必须显式带中文头，否则海外服务器会拿到英文页面。
 class TMDBWebClient:
     BASE = "https://www.themoviedb.org"
 
@@ -293,6 +294,11 @@ class TMDBWebClient:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         )
+        # 关键：强制中文内容（简体优先，其次繁体），避免海外 IP 返回英文
+        self.session.headers.setdefault(
+            "Accept-Language",
+            "zh-CN,zh-TW;q=0.9,zh;q=0.8,en;q=0.3",
+        )
 
     # 工具 --------------------------------------------------------------
     @staticmethod
@@ -300,10 +306,16 @@ class TMDBWebClient:
         m = re.search(r'<meta property="og:%s" content="([^"]*)"' % re.escape(prop), html)
         return m.group(1) if m else None
 
-    def _fetch_page(self, url):
-        r = self.session.get(url, timeout=20)
-        r.raise_for_status()
-        return r.text
+    def _fetch_page(self, url, retry=2):
+        last = None
+        for _ in range(retry + 1):
+            try:
+                r = self.session.get(url, timeout=20)
+                r.raise_for_status()
+                return r.text
+            except Exception as e:
+                last = e
+        raise last
 
     @staticmethod
     def _clean_title(t):
@@ -316,24 +328,48 @@ class TMDBWebClient:
         m = re.search(r"\((\d{4})\)", t)
         return m.group(1) if m else ""
 
+    @staticmethod
+    def _has_cjk(s):
+        return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
+
     def _cast_from_html(self, html, limit=10):
-        """从 id='cast' 区块抓演员中文名（缩略图 alt / 人物名文本）"""
+        """从 id='cast' 区块抓演员中文名。
+
+        只认 <a href="/person/数字..."> 节点里的头像 alt，避免把
+        “奖项 / 导演 / 预告片” 之类的界面文字当演员抓进来。
+        """
         seg = html
         idx = html.find('id="cast"')
         if idx >= 0:
-            seg = html[idx: idx + 300000]
+            seg = html[idx: idx + 400000]
         names, seen = [], set()
-        # 头像 alt 通常就是演员名
-        for a in re.findall(r'alt="([^"]{1,40})"', seg):
-            a = a.strip()
-            if not a or a.startswith("${") or len(a) > 30:
-                continue
-            # 排除图片 alt 中的非人名噪音
-            if a not in seen and not re.match(r"^[a-zA-Z0-9]{1,3}$", a):
+        # 方案A：person 链接卡片内的 alt
+        for m in re.finditer(
+            r'<a[^>]+href="/person/\d+[^"]*"[^>]*>'
+            r'(?:(?!</a>).)*?alt="([^"]{1,50})"',
+            seg, re.S,
+        ):
+            a = m.group(1).strip()
+            if a and a not in seen and not a.startswith("${"):
                 seen.add(a)
                 names.append(a)
             if len(names) >= limit:
                 break
+        # 方案B（回退）：cast 区块全部 alt，但过滤常见界面词
+        if not names:
+            noise = {"奖项", "导演", "编剧", "演员", "预告片", "海报", "剧照",
+                     "The Movie Database (TMDB)", "Poster", "Backdrop", "Video",
+                     "Search", "Profile", "登录", "注册"}
+            for a in re.findall(r'alt="([^"]{1,40})"', seg):
+                a = a.strip()
+                if (a and a not in seen and a not in noise
+                        and not a.startswith("${") and len(a) <= 30
+                        and not re.match(r"^[a-zA-Z0-9]{1,3}$", a)):
+                    seen.add(a)
+                    names.append(a)
+                if len(names) >= limit:
+                    break
+        return names[:limit]
         # 上面的 alt 可能混入站点图标名，用人物链接二次校验后取靠前结果
         cast = []
         for n in names:
@@ -344,22 +380,28 @@ class TMDBWebClient:
 
     def detail_by_id(self, tmdb_id):
         """按 TMDB ID 抓取中文资料（movie/tv 自动探测）。
-        返回 {type, info, poster_url} 或 None"""
+
+        语言由会话的 Accept-Language: zh-CN 头保证（与服务器 IP 无关）。
+        若简中缺数据落到繁体/英文，标题含 CJK 即视为中文命中。
+        """
         if not str(tmdb_id).isdigit():
             return None
+        last_info = None
         for media in ("movie", "tv"):
             try:
-                html = self._fetch_page(f"{self.BASE}/zh-CN/{media}/{tmdb_id}")
+                html = self._fetch_page(f"{self.BASE}/{media}/{tmdb_id}")
             except Exception:
-                try:
-                    html = self._fetch_page(f"{self.BASE}/{media}/{tmdb_id}")
-                except Exception:
-                    continue
+                continue
             info = self._parse_detail_html(html, tmdb_id)
-            if info:
-                return {"type": media, "info": info,
-                        "poster_url": self._html_meta(html, "image")}
-        return None
+            if not info:
+                continue
+            poster_url = self._html_meta(html, "image")
+            # 英文兜底结果先记下；中文命中则立刻返回
+            if self._has_cjk(info.get("title", "")):
+                return {"type": media, "info": info, "poster_url": poster_url}
+            last_info = {"type": media, "info": info, "poster_url": poster_url}
+        # 完全没有中文资料时，返回最后的英文结果（原题可用）
+        return last_info
 
     def search_by_name(self, query, year=None):
         """无 Key：抓 TMDB 站内搜索页，解析候选 (title, id, media_type, year)。
