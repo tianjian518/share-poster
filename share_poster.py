@@ -44,7 +44,7 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
@@ -694,6 +694,119 @@ class PosterMaker:
         return canvas
 
 
+# --- 海报/封面 文件工具 -------------------------------------------------
+POSTER_MAX_BYTES = 480 * 1024   # 目标：单张海报 < 500KB
+POSTER_MAX_SIDE = 1200          # 最长边上限
+
+
+def poster_to_jpeg(img, max_bytes=POSTER_MAX_BYTES, max_side=POSTER_MAX_SIDE):
+    """把海报图压成 JPEG bytes：等比缩放 + 自适应质量，确保 < max_bytes"""
+    if img is None:
+        return None
+    im = img.convert("RGB")
+    w, h = im.size
+    if max(w, h) > max_side:
+        r = max_side / float(max(w, h))
+        im = im.resize((max(1, int(w * r)), max(1, int(h * r))), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    for q in (85, 78, 70, 60, 50):
+        buf.seek(0)
+        buf.truncate()
+        im.save(buf, format="JPEG", quality=q, optimize=True)
+        if buf.tell() <= max_bytes:
+            break
+    # 仍超限就再缩边
+    while buf.tell() > max_bytes and max(im.size) > 400:
+        im = im.resize((int(im.width * 0.8), int(im.height * 0.8)), Image.LANCZOS)
+        buf.seek(0)
+        buf.truncate()
+        im.save(buf, format="JPEG", quality=70, optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+
+def poster_to_png(img):
+    """转 PNG bytes（剪贴板图片粘贴需要 PNG 格式）"""
+    if img is None:
+        return None
+    buf = io.BytesIO()
+    img.convert("RGBA").save(buf, format="PNG")
+    buf.seek(0)
+    return buf.read()
+
+
+def make_collection_cover(base_poster, title, count, accent=(20, 22, 26)):
+    """基于第一部电影海报合成一张合集封面：竖版 2:3，底部黑条写合集信息"""
+    if base_poster is None:
+        return None
+    p = base_poster.convert("RGB")
+    # 统一按 2:3 裁边
+    w, h = p.size
+    target_ratio = 2 / 3
+    cur = w / h
+    if cur > target_ratio:
+        nw = int(h * target_ratio)
+        x0 = (w - nw) // 2
+        p = p.crop((x0, 0, x0 + nw, h))
+    elif cur < target_ratio:
+        nh = int(w / target_ratio)
+        y0 = (h - nh) // 2
+        p = p.crop((0, y0, w, y0 + nh))
+
+    W = 900
+    H = int(W * 1.5)
+    p = p.resize((W, H), Image.LANCZOS)
+
+    bar_h = 150
+    canvas = Image.new("RGB", (W, H + bar_h), accent)
+    canvas.paste(p, (0, 0))
+    d = ImageDraw.Draw(canvas)
+    t = (title or "影视合集").strip()
+    if len(t) > 16:
+        t = t[:16] + "…"
+    label = f"{t} · 共 {count} 部"
+    # 字号自适应：从 64 往下找能放下的
+    fs = 64
+    font = None
+    while fs >= 26:
+        font = PosterMaker._load_fonts(fs)[0]
+        if d.textlength(label, font=font) <= W - 80:
+            break
+        fs -= 4
+    if font is None:
+        font = PosterMaker._load_fonts(26)[0]
+    tb = font.getbbox(label)
+    tx = (W - (tb[2] - tb[0])) // 2
+    ty = H + (bar_h - (tb[3] - tb[1])) // 2 - tb[1]
+    d.text((tx, ty), label, fill=(255, 255, 255), font=font)
+    return canvas
+
+
+def _try_collection_cover(items, series_name, count, size="w780"):
+    """给合集找一张封面：取最早年份且带 tmdb-id 的条目，下载其海报合成合集封面。
+    全部无 tmdb 标记则返回 None。"""
+    if not items:
+        return None
+    ordered = sorted(items, key=lambda x: (x.get("year") or 9999))
+    for it in ordered:
+        if not it.get("tmdb"):
+            continue
+        try:
+            got = TMDBWebClient().detail_by_id(it["tmdb"])
+            if got and got.get("poster_url"):
+                r = requests.get(got["poster_url"], timeout=20)
+                r.raise_for_status()
+                img = Image.open(io.BytesIO(r.content))
+                img.load()
+                cover = make_collection_cover(img, series_name, count)
+                if cover:
+                    return cover
+        except Exception:
+            continue
+    return None
+
+
 # --- 配置持久化 ----------------------------------------------------------
 def config_path():
     return Path.home() / ".share_poster.json"
@@ -825,12 +938,18 @@ def main():
                         help="生成配图（默认）")
     parser.add_argument("--no-image", dest="make_image", action="store_false",
                         help="只生成文本，不出图")
+    parser.add_argument("--image-mode", choices=["long", "poster", "none"], default=None,
+                        help="出图方式: long=长图(默认) / poster=仅海报或封面 / none=无图")
     parser.add_argument("--image-width", type=int, default=720, help="长图宽度")
     parser.add_argument("--font-size", type=int, default=28, help="正文字号")
     parser.add_argument("--no-net", action="store_true",
                         help="禁用分享页/TMDB 网页抓取（只用手动/Key 数据）")
     parser.add_argument("--save-config", action="store_true", help="保存当前 key 到 ~/.share_poster.json")
     args = parser.parse_args()
+
+    # 出图模式：显式 --image-mode 优先；--no-image 兼容为 none
+    mode = args.image_mode or ("none" if not args.make_image else "long")
+    want_pic = mode in ("long", "poster")
 
     cfg = load_config()
     api_key = args.key or cfg.get("tmdb_api_key") or os.environ.get("TMDB_API_KEY", "")
@@ -910,7 +1029,7 @@ def main():
             txt_path = out_dir / f"{safe}_share.txt"
             txt_path.write_text(collection_text, encoding="utf-8")
             print(f"📄 文本已保存:{txt_path}")
-            if args.make_image:
+            if mode == "long":
                 try:
                     maker = PosterMaker(width=args.image_width, font_size=args.font_size)
                     img = maker.render(collection_text, None,
@@ -920,6 +1039,17 @@ def main():
                     print(f"🖼  长图已保存:{img_path}")
                 except Exception as e:
                     sys.stderr.write(f"[生成图片失败] {e}\n")
+            elif mode == "poster":
+                cover = _try_collection_cover(items, raw_name or "影视合集", len(items))
+                if cover is None:
+                    sys.stderr.write("⚠ 子文件无 TMDB 标记，无法生成合集封面，仅输出文本\n")
+                else:
+                    data = poster_to_jpeg(cover)
+                    cov_path = out_dir / f"{safe}_cover.jpg"
+                    with open(cov_path, "wb") as f:
+                        f.write(data)
+                    print(f"🖼  合集封面已保存:{cov_path} "
+                          f"({len(data) / 1024:.0f}KB)")
             if api_key and (args.save_config or not cfg.get("tmdb_api_key")):
                 save_config({**cfg, "tmdb_api_key": api_key})
             print("\n完成 ✅")
@@ -960,7 +1090,7 @@ def main():
                         detail["_type"] = mt
                         info = detail
                         title_for_filename = detail.get("title") or detail.get("name") or raw_name
-                        if not poster_url and args.make_image:
+                        if not poster_url and want_pic:
                             poster_img = tmdb.download_image(detail.get("poster_path"), args.poster_size)
                         break
         elif info.get("_manual"):
@@ -1010,7 +1140,7 @@ def main():
         info["release_date"] = f"{share_year}-01-01"
 
     # 下载海报（TMDB 网页模式返回的是完整 URL）
-    if poster_img is None and poster_url and args.make_image:
+    if poster_img is None and poster_url and want_pic:
         try:
             r = requests.get(poster_url, timeout=20)
             r.raise_for_status()
@@ -1041,8 +1171,7 @@ def main():
     txt_path.write_text(text, encoding="utf-8")
     print(f"📄 文本已保存:{txt_path}")
 
-    img_path = None
-    if args.make_image:
+    if mode == "long":
         try:
             maker = PosterMaker(width=args.image_width, font_size=args.font_size)
             img = maker.render(text, poster_img=poster_img,
@@ -1052,6 +1181,16 @@ def main():
             print(f"🖼  长图已保存:{img_path}")
         except Exception as e:
             sys.stderr.write(f"[生成图片失败] {e}\n")
+    elif mode == "poster":
+        if poster_img is None:
+            sys.stderr.write("⚠ 未获取到海报，无法输出海报文件"
+                             "（可用 --poster-url 手动指定海报地址）\n")
+        else:
+            data = poster_to_jpeg(poster_img)
+            poster_path = out_dir / f"{safe_title}_poster.jpg"
+            with open(poster_path, "wb") as f:
+                f.write(data)
+            print(f"🖼  海报已保存:{poster_path} ({len(data) / 1024:.0f}KB)")
 
     # 7. 配置
     if api_key and (args.save_config or not cfg.get("tmdb_api_key")):
@@ -1213,13 +1352,19 @@ def build_collection_text(share, series_name, items, quality=None, size=None, sy
 # --- 一键生成（供 CLI / Web 复用） --------------------------------------
 def generate(share_text, quality=None, size=None, title=None, pick=1,
              include_image=True, width=720, font_size=28,
-             cloud=None, verbose=True):
+             cloud=None, verbose=True, image_mode=None):
     """输入分享文本，走完整自动链路，返回：
-    {ok, text, title, image_b64 (PNG), cloud, size_hint,
-     manual(bool: 是否落入手工兜底), error}
+    {ok, text, title, image_b64 (长图PNG) | cover_b64(合集封面JPG),
+     poster_jpg_b64 / poster_png_b64 (仅 image_mode='poster'),
+     cloud, manual, error}
+
+    image_mode: None(默认,沿用 include_image) / 'long' 长图 / 'poster' 仅海报 / 'none' 无图
     """
+    mode = image_mode or ("long" if include_image else "none")
     result = {"ok": False, "text": "", "title": "", "image_b64": "",
+              "cover_b64": "", "poster_jpg_b64": "", "poster_png_b64": "",
               "cloud": "", "manual": False, "error": ""}
+    want_pic = mode in ("long", "poster")
 
     def log(*a):
         if verbose:
@@ -1283,16 +1428,25 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
         log("\n" + "─" * 56)
         log(text)
         log("─" * 56 + "\n")
-        if include_image:
+        import base64 as _b64
+        if mode == "long":
             try:
                 maker = PosterMaker(width=width, font_size=font_size)
                 img = maker.render(text, None, title=result["title"])
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
-                import base64
-                result["image_b64"] = base64.b64encode(buf.getvalue()).decode()
+                result["image_b64"] = _b64.b64encode(buf.getvalue()).decode()
             except Exception as e:
                 log(f"  ⚠ 合集长图生成失败: {e}")
+        elif mode == "poster":
+            # 合成一张合集封面（首部海报 + 底部标注），转 JPEG < 500KB
+            cover = _try_collection_cover(items, result["title"], len(items))
+            if cover is None:
+                log("  ⚠ 子文件无 TMDB 标记，无法生成合集封面")
+            else:
+                jpg = poster_to_jpeg(cover)
+                if jpg:
+                    result["cover_b64"] = _b64.b64encode(jpg).decode()
         result["ok"] = True
         return result
 
@@ -1343,7 +1497,7 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
     result["manual"] = bool(info.get("_manual"))
 
     # 海报下载
-    if poster_url and include_image:
+    if poster_url and want_pic:
         try:
             r = requests.get(poster_url, timeout=20)
             r.raise_for_status()
@@ -1364,17 +1518,27 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
     log(text)
     log("─" * 56 + "\n")
 
-    if include_image:
+    import base64 as _b64
+    if mode == "long":
         try:
             maker = PosterMaker(width=width, font_size=font_size)
             img = maker.render(text, poster_img=poster_img,
                                title=result["title"])
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            import base64
-            result["image_b64"] = base64.b64encode(buf.getvalue()).decode()
+            result["image_b64"] = _b64.b64encode(buf.getvalue()).decode()
         except Exception as e:
             log(f"  ⚠ 长图生成失败: {e}")
+    elif mode == "poster":
+        if poster_img is None:
+            log("  ⚠ 未获取到海报（可用 --poster-url 手动提供）")
+        else:
+            jpg = poster_to_jpeg(poster_img)
+            png = poster_to_png(poster_img)
+            if jpg:
+                result["poster_jpg_b64"] = _b64.b64encode(jpg).decode()
+            if png:
+                result["poster_png_b64"] = _b64.b64encode(png).decode()
 
     result["ok"] = True
     return result
