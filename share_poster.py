@@ -330,7 +330,7 @@ class CloudShareFetcher:
             for parent, kids in zip(pend, children):
                 pname = parent.get("fileName") or ""
                 pt, py, ptm = parse_share_title(pname)
-                # 父目录名本身不像一部片（如「速度与激情 合集」「MP4&MKV」）时，
+                # 父目录名本身不像一部片（如「XX 合集」「MP4&MKV」）时，
                 # 不要把合集名当成子文件的片名，改为继承更上层的有效身份
                 if not looks_like_single_title(pname):
                     pt = parent.get("_dir_title")
@@ -1044,7 +1044,7 @@ def _poster_for_item(it, web=None, try_search=True):
             return img
     if not try_search or not title:
         return None
-    # “速度与激情 1” 这种尾部序号可能搜不到，再试去掉序号的名字
+    # “示例电影 1” 这种尾部序号可能搜不到，再试去掉序号的名字
     names = [title, re.sub(r"[\s\-_]*\d+\s*$", "", title).strip()]
     for n in dict.fromkeys([x for x in names if x]):
         try:
@@ -1456,7 +1456,7 @@ _VERSION_WORDS = [
 def extract_version_tags(name, limit=None):
     """从原始名字里抽「版本标记」列表（从具体到宽泛），用于同名区分。
 
-    比如 `速度与激情2.2003.国英双语.中英字幕￡CMCT死亡骑士`
+    比如 `示例电影2.2003.国英双语.中英字幕￡GROUPNAME`
       → ['国配双语', 'CMCT死亡骑士']
     """
     if not name:
@@ -1722,7 +1722,7 @@ def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
         old = (d.get("fileName") or "").strip()
         if not old or is_junk_title(old):
             continue
-        # 分享根目录（名字通常就是分享标题，如「速度与激情 合集」）不动，
+        # 分享根目录（名字通常就是分享标题，如「XX 合集」）不动，
         # 否则会把「XX 合集」也改成单片格式。
         if str(d.get("fileId")) == root_fid or is_collection_title(old):
             continue
@@ -1776,8 +1776,8 @@ def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
             title, year, tmdb = parse_share_title(stem)
             year = int(year) if (year or "").isdigit() else None
             # 父目录与 fileId 都没命中 → 用文件名自己再兜两层：
-            #   ① 归一化片名直接命中（`Furious Seven` ↔ `速度与激情7` 不行，但同语言可以）
-            #   ② 年份唯一时反查（`The Fast and the Furious (2001)` → 2001 只有这部，认领中文名）
+            #   ① 归一化片名直接命中（`Sequel Title` ↔ `中文续集名` 不行，但同语言可以）
+            #   ② 年份唯一时反查（`Some Movie (2001)` → 2001 只有这部，认领中文名）
             cand = item_by_key.get(_norm_key(title or stem))
             if cand is None and year and str(year).isdigit():
                 cand = item_by_year.get(int(year))
@@ -1885,14 +1885,14 @@ def guess_quality(size_bytes):
     return "HD 高清"
 
 
-# 罗马数字序号 → 阿拉伯数字（合集里常见「速度与激情 Ⅰ/Ⅱ/Ⅲ」）
+# 罗马数字序号 → 阿拉伯数字（合集里常见「示例电影 Ⅰ/Ⅱ/Ⅲ」）
 ROMAN_MAP = {
     "Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "Ⅴ": "5",
     "Ⅵ": "6", "Ⅶ": "7", "Ⅷ": "8", "Ⅸ": "9", "Ⅹ": "10",
 }
 
 # 英文续集关键词 → 第几部（用于把 "The.Matrix.Reloaded" 这类英文片名
-# 与中文文件夹 "黑客帝国2" 按序号对上。只作兜底匹配用）
+# 与中文文件夹 "示例电影2" 按序号对上。只作兜底匹配用）
 SEQUEL_KEYWORDS = {
     "reloaded": 2, "revolutions": 3, "resurrections": 4, "revolution": 3,
     "renaissance": 4, "resurgence": 2, "retaliation": 3, "redemption": 4,
@@ -1933,11 +1933,11 @@ def parse_share_title(raw_title, is_share_title=False):
     """从分享标题里拆 (片名, 年份, tmdb_id)。示例：
     《星球大战：曼达洛人与古古 (2026) {tmdb-1228710}》
     片名.2026.2160P  ...
-    速度与激情2 (2003) {tmdb-584} - 4K REMUX 4K
+    示例电影2 (2003) {tmdb-584} - 4K REMUX 4K
 
     is_share_title=True 时按「分享总标题」解析：
       · 不套用「取方括号中文」规则（该规则是给文件名用的，会把
-        【詹妮弗·康纳利】绝世美女-电影合集【42部】错切成「詹妮弗·康纳利」）
+        【某演员】电影合集【42部】错切成「某演员」）
       · 清掉【N部】【合集】等描述词后仍保留主体语义
     """
     if not raw_title:
@@ -1969,10 +1969,10 @@ def parse_share_title(raw_title, is_share_title=False):
     # 无括号的发布组水印： “高清影视之家发布” “XX字幕组压制” 等（分享标题剥壳后会露出来）
     t = re.sub(r"^[^\u4e00-\u9fff]{0,10}[\u4e00-\u9fff]{0,12}"
                r"(?:发布|制作|压制|出品|字幕组|影视之家)\s*", " ", t)
-    # 「演员个人作品合集」常见首字母分类前缀： “M-美国往事” “S -死亡中惊醒” → 去掉前缀
+    # 「演员个人作品合集」常见首字母分类前缀： “M-示例电影” “S -另一部片” → 去掉前缀
     # 仅当短横线前是 1-2 个字母（分类字母）时去掉，避免误伤 “X战警” “T-34” 这类真片名
     t = re.sub(r"^\s*[A-Za-z]{1,2}\s*[-–—]\s*(?=[\u4e00-\u9fff])", "", t)
-    # 文件名形如 “[速度与激情2].2.Fast.2.Furious.2003...” → 取方括号里的中文片名
+    # 文件名形如 “[示例电影2].2.Example.Movie.2003...” → 取方括号里的中文片名
     # （仅文件名场景；分享总标题不能套用，否则会丢掉方括号外的真正片名主体）
     if not is_share_title:
         m0 = re.match(r"^\s*[\[【]([^\]】]{1,40})[\]】]", t)
@@ -1999,8 +1999,8 @@ def parse_share_title(raw_title, is_share_title=False):
     t = re.sub(r"(国英双语|中英双语|中英字幕|国粤双语|双语字幕|内封字幕|外挂字幕|"
                r"国语|粤语|英语|中字|字幕|双语|简繁|特效|纯净|无水印|"
                r"国配|台配|导演剪辑|加长版|导剪版)", "", t, flags=re.I)
-    # 英文名里的点号当空格：`The.Fast.and.the.Furious` → `The Fast and the Furious`。
-    # 中文名不受影响（「速度与激情：特别行动」里的点是全角，不在替换范围）。
+    # 英文名里的点号当空格：`Some.Movie.Name` → `Some Movie Name`。
+    # 中文名不受影响（「示例电影：副标题」里的点是全角，不在替换范围）。
     if not re.search(r"[\u4e00-\u9fff]", t):
         t = t.replace(".", " ")
     t = re.sub(r"\s+", " ", t).strip(" .-_")
@@ -2470,8 +2470,8 @@ def main():
 # --- 合集识别与处理 ----------------------------------------------------
 # 分享里常见的资源形态：
 #   单部：1 个视频文件（可带字幕/封面）→ 现有单部流程
-#   合集：多部不同影片（周星驰合集 / 黑客帝国1-4 / 指环王三部曲）→ 本组函数
-# 子文件名通常形如：黑客帝国 (1999) {tmdb-603} [1080p H.265].mkv
+#   合集：多部不同影片（演员合集 / 系列 1-4 / 系列三部曲）→ 本组函数
+# 子文件名通常形如：示例电影 (1999) {tmdb-603} [1080p H.265].mkv
 
 NON_MEDIA_EXTS = {".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".lrc",
                   ".txt", ".nfo", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}
@@ -2522,7 +2522,7 @@ def _identity_score(c):
             s += 2
         if len(t) <= 40:
             s += 1
-        # 纯英文原名（Fast.and.Furious）仍可用，只是优先级低
+        # 纯英文原名（Some.Movie.Name）仍可用，只是优先级低
     return s
 
 
@@ -2557,7 +2557,7 @@ def _build_identity_maps(dir_nodes, deep_files):
 
     动机：`_pick_identity` 只能从「父目录」继承身份，一旦文件直接挂在分享根目录
     （父目录名是「XX 合集」这种合集名，解析不出单片身份），中文片名和 TMDB 就全丢了，
-    重命名后变成 `The.Fast.and.the.Furious (2001)....mkv` 这种半截名字。
+    重命名后变成 `Some.Movie (2001).1080p.BluRay.mkv` 这种半截名字。
 
     于是这里建两张表：
       map_year       year      → (title, year, tmdb)      年份在整份分享里唯一时最可靠
@@ -2593,7 +2593,7 @@ def _build_identity_maps(dir_nodes, deep_files):
     def _pick(a, b):
         """两个身份里挑信息更全的：有中文名 > 有 tmdb > 名字里带序号。
 
-        同一个年份有多条记录时优先用带序号的（「速度与激情 1」胜过「速度与激情」，
+        同一个年份有多条记录时优先用带序号的（「示例电影 1」胜过「示例电影」，
         否则第一部会被写成没有序号的裸名，和整个系列对不上）。
         """
         def score(x):
@@ -2847,7 +2847,7 @@ def collect_media_items(deep_files, dir_nodes=None):
 def enrich_items_with_tmdb(items, max_items=40, workers=4, verbose=False):
     """给没有 tmdb-id 的条目按「片名 + 年份」搜 TMDB 补 id 与中文名。
 
-    演员个人作品合集（如「詹妮弗·康纳利 42 部」）的分享里通常不带 {tmdb-id}，
+    演员个人作品合集（如「某演员 42 部」）的分享里通常不带 {tmdb-id}，
     会导致封面只能掉到「剧照拼图」兜底、片单也拿不到中文名。这里统一补全。
     命中后：
       · 填 tmdb id（供封面直取官方海报）

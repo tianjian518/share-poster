@@ -391,7 +391,8 @@ PAGE = r"""<!doctype html>
 
   <div class="card">
     <label>分享链接 / 分享文本（自动识别网盘 + 片名，支持 {tmdb-id} 直取资料）</label>
-    <textarea id="in" placeholder="例如：https://www.guangyapan.com/s/1944450213920591880_aeWXvQh3mcEVHL5Y"></textarea>
+    <textarea id="in" placeholder="例如：https://www.guangyapan.com/s/xxxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx"></textarea>
+    <p style="margin:6px 0 0;font-size:12px;opacity:.6">把链接发给自己就能拿到；别人发的分享也直接粘进来。生成的帖子只包含链接和片单，**不会**上传或泄露你自己的账号信息。</p>
     <div class="opts">
       <input id="quality" placeholder="质量覆盖（选填）如 2160P REMUX HEVC">
       <input id="size" placeholder="大小覆盖（选填）如 40.5GB">
