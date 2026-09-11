@@ -45,7 +45,7 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.1.1"
+VERSION = "1.1.3"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
@@ -1320,8 +1320,12 @@ class GuangyaAccount:
         r.raise_for_status()
         return self._apply_token(r.json())
 
-    def user_info(self):
-        """获取当前登录用户信息（只带基础头 + authorization）"""
+    def user_info(self, _retried=False):
+        """获取当前登录用户信息（只带基础头 + authorization）。
+
+        access_token 过期时（很常见，默认只有 2 小时）自动用
+        refresh_token 续期后重试一次。
+        """
         if not self.token:
             raise RuntimeError("未登录：token 为空")
         h = {
@@ -1335,6 +1339,10 @@ class GuangyaAccount:
         # 注意：这个接口是 GET，用 POST 会返回 501 Method Not Allowed
         r = self.session.get(f"{self.ACCOUNT_BASE}/v1/user/me",
                              headers=h, timeout=20)
+        if r.status_code == 401 and self.refresh_token_value and not _retried:
+            # token 过期 → 用 refresh_token 换新的再试一次
+            self.refresh_token()
+            return self.user_info(_retried=True)
         r.raise_for_status()
         return r.json()
 
@@ -1428,6 +1436,69 @@ def guangya_login_interactive():
 
 
 # --- 分享内文件重命名 ------------------------------------------------------
+# --- 同片多版本：区分标记 -----------------------------------------------
+# 一个分享里同一部片常有多个版本（4K / 1080P / 双语 / 导演剪辑…）。
+# 规范化后名字会撞在一起，所以撞名时补一个「有信息量」的标记：
+#   优先用画质（2160P 还是 1080P，最直观）
+#   其次用版本词（EXTENDED / PROPER / 国配 / 未删减…）
+#   最后才退回 -v2 / -v3 纯序号
+_VERSION_WORDS = [
+    ("extended", "EXTENDED"), ("director", "导演剪辑"), ("remastered", "重制"),
+    ("proper", "PROPER"), ("repack", "REPACK"), ("remux", None),   # remux 已在画质里
+    ("imax", "IMAX"), ("unrated", "未分级"), ("uncut", "未删减"),
+    ("hdr", None), ("dolby", None), ("dv", None),
+    ("国英双语", "国配双语"), ("国配", "国语"), ("双语", "双语"),
+    ("中字", None), ("中英字幕", None), ("内嵌", None), ("外挂", None),
+    ("3d", "3D"), ("注释", None),
+]
+
+
+def extract_version_tags(name, limit=None):
+    """从原始名字里抽「版本标记」列表（从具体到宽泛），用于同名区分。
+
+    比如 `速度与激情2.2003.国英双语.中英字幕￡CMCT死亡骑士`
+      → ['国配双语', 'CMCT死亡骑士']
+    """
+    if not name:
+        return []
+    lo = name.lower()
+    tags = []
+    for kw, label in _VERSION_WORDS:
+        if label is None:
+            continue
+        if kw in lo and label not in tags:
+            tags.append(label)
+    # 分辨率 / 编码：名字里写着 1080p、HEVC 时也是很好的区分依据
+    for pat, fmt in ((r"\b(2160|1080|720|480)\s*p\b", "{}P"),
+                     (r"\b(4k|uhd)\b", "4K")):
+        m = re.search(pat, lo)
+        if m:
+            v = fmt.format(m.group(1).upper())
+            if v not in tags:
+                tags.append(v)
+    # 常见的双语/字幕组：￡CMCT无尽 / -FGT / RARBG
+    m = re.search(r"[￡￥]([A-Za-z0-9\u4e00-\u9fff]{2,10})", name)
+    if m:
+        tags.append(m.group(1))
+    m = re.search(r"-([A-Z]{2,10})(?:\.|$)", name)
+    if m and m.group(1) not in ("MKV", "MP4", "AVI"):
+        tags.append(m.group(1))
+    # 去冗余：「国配双语」已经含「双语」，就别再挂一个「双语」了
+    out = []
+    for t in tags:
+        if any(t != o and t in o for o in tags):
+            continue
+        if t not in out:
+            out.append(t)
+    return out if limit is None else out[:limit]
+
+
+def extract_version_tag(name):
+    """抽一条最合适的版本标记（兼容旧调用）。"""
+    tags = extract_version_tags(name, limit=1)
+    return tags[0] if tags else ""
+
+
 def rename_plan_lines(plan, limit=None, status_of=None):
     """把重命名计划渲染成可读文本行（CLI / Web 共用）。"""
     out = []
@@ -1501,7 +1572,7 @@ def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
     # 支持两种 items：
     #   · collect_media_items() 的新格式 —— 自带 fileId/fileIds，精确到文件
     #   · 旧格式 / 测试数据 —— 只带标题，退化为按目录名匹配
-    item_by_key, item_by_fid = {}, {}
+    item_by_key, item_by_fid, item_by_year = {}, {}, {}
     for it in items or []:
         k = _norm_key(it.get("title"))
         if k and k not in item_by_key:
@@ -1509,6 +1580,15 @@ def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
         for fid in ([it.get("fileId")] + list(it.get("fileIds") or [])):
             if fid:
                 item_by_fid[str(fid)] = it
+    # 年份索引：整份分享里该年份只有一部片时才好用（避免同年的不同片张冠李戴）
+    _ycnt = {}
+    for it in items or []:
+        if it.get("year"):
+            _ycnt[it["year"]] = _ycnt.get(it["year"], 0) + 1
+    for it in items or []:
+        y = it.get("year")
+        if y and _ycnt.get(y) == 1:
+            item_by_year[y] = it
 
     def _fmt(**kw):
         if name_fmt:
@@ -1529,18 +1609,115 @@ def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
 
     plan = []
 
-    def _push(file_id, is_dir, old, new, reason=""):
+    def _split_ext(name, is_dir):
+        if is_dir:
+            return name, ""
+        stem, dot, ext = name.rpartition(".")
+        return (stem, ext) if dot else (name, "")
+
+    def _register(name, file_id):
+        _used_names[name.lower()] = str(file_id)
+        return name
+
+    # 已经出现过的「原始名」——用来判断两个目标撞名的文件到底是不是同一个副本
+    _seen_src = set()
+    # 已经占用的「目标名」——用于撞名时补后缀
+    _used_names = {}
+
+    def _dedup(new, file_id, is_dir, quality, src_name, dup=False):
+        """同片多版本撞名时，补一个「能看出区别」的标记。
+
+        候选按「信息量从多到少」依次试，第一个没被占用的就用：
+          ① 原名就是同一个文件（同名副本）→ 不加，让 Emby 自己加 (2)
+          ② 画质（撞名的往往就是不同画质）
+          ③ 版本词：PROPER / EXTENDED / 国配双语 / FGT / CMCT死亡骑士…
+          ④ 版本词两两组合
+          ⑤ 纯序号 v2 / v3（实在没线索才用）
+        """
+        # ① 同源副本：改用序号区分（内容虽同，但同目录下不能重名）
+        if dup:
+            key0 = new.lower()
+            if key0 not in _used_names:
+                return _register(new, file_id)
+            stem, ext = _split_ext(new, is_dir)
+            suffix = ("." + ext) if ext else ""
+            n = 2
+            while True:
+                cand = f"{stem} - v{n}{suffix}"
+                if cand.lower() not in _used_names:
+                    return _register(cand, file_id)
+                n += 1
+
+        key = new.lower()
+        if key not in _used_names:
+            return _register(new, file_id)
+
+        stem, ext = _split_ext(new, is_dir)
+        suffix = ("." + ext) if ext else ""
+
+        cands = []
+        # ② 版本词 / 发布组优先：PROPER、EXTENDED、FGT、CMCT… 这类区分度最高，
+        #    而且不会跟已有的 `[1080P H.264 蓝光]` 画质标签重复
+        _base = new.lower()
+        tags = [t for t in extract_version_tags(src_name) if t.lower() not in _base]
+        cands.extend(tags)
+        # ③ 画质（同片不同画质撞名时用，且必须是名字里还没写过的那一档）
+        if quality and f"[{quality}]" not in new:
+            cands.append(quality)
+        # ④ 两两组合，给区分度不够的单标签再加一层保险
+        for i, a in enumerate(tags):
+            for b in tags[i + 1:]:
+                cands.append(f"{a} · {b}")
+        # 同片不同「分辨率/编码」时，画质标签往往才是唯一区别（如 1080P vs 2160P），
+        # 上面被过滤掉的低分辨率标记作为最后的信息性兜底再放回来
+        for t in extract_version_tags(src_name):
+            if re.match(r"^\d+[Pp]$|^4K$", t) and t not in cands:
+                cands.append(t)
+        for info in cands:
+            cand = f"{stem} - {info}{suffix}"
+            if cand.lower() not in _used_names:
+                return _register(cand, file_id)
+        # ⑤ 实在没线索 → 纯序号兜底
+        n = 2
+        while True:
+            cand = f"{stem} - v{n}{suffix}"
+            if cand.lower() not in _used_names:
+                return _register(cand, file_id)
+            n += 1
+
+    def _push(file_id, is_dir, old, new, reason="", quality="", src_name=""):
         new = (new or "").strip()
-        if not file_id or not old or not new:
+        if not old or not new:
             return
-        if new == old:
+        src_key = old.lower()
+        dup = src_key in _seen_src
+        _seen_src.add(src_key)
+        # 名字本来就规范、且没有副本要区分 → 跳过，省一次没必要的改名请求。
+        # 但必须先把目标名登记进 _used_names，否则后面同片多版本撞上来时
+        # 检测不到冲突，两个版本会重名。
+        if new == old and not dup:
+            _register(new, file_id)
             return
+        new = _dedup(new, file_id, is_dir, quality, src_name or old, dup=dup)
         plan.append({"fileId": str(file_id), "is_dir": is_dir,
                      "old": old, "new": new, "changed": True,
                      "reason": reason})
 
     # ---- 文件夹 ----
     root_fid = str(dir_nodes[0].get("fileId")) if dir_nodes else ""
+    # 哪些目录「确实装着视频」——只有这些才值得改名。
+    # 空壳目录（只剩截图/字幕/说明 txt，视频缺失）改名只会帮倒忙：
+    # 名字变规范了却没有内容，还得靠 TMDB 猜年份，容易出错。
+    dirs_with_media = set()
+    for f in (deep_files or []):
+        fext = (f.get("ext") or Path(f.get("fileName") or "").suffix or "").lower()
+        if fext in MEDIA_EXTS:
+            if f.get("parentId"):
+                dirs_with_media.add(str(f["parentId"]))
+            for pid in str(f.get("fullParentIds") or "").split("/"):
+                if pid:
+                    dirs_with_media.add(pid)
+
     for d in (dir_nodes or []):
         old = (d.get("fileName") or "").strip()
         if not old or is_junk_title(old):
@@ -1555,13 +1732,27 @@ def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
         if not t:
             continue
         it = item_by_fid.get(str(d.get("fileId"))) or item_by_key.get(_norm_key(t))
+        # 没装着视频的目录：跳过（除非条目本身带 tmdb，说明识别很确定）
+        if str(d.get("fileId")) not in dirs_with_media \
+                and not (it or {}).get("tmdb") and not tm:
+            continue
+        # 文件夹内部如果没视频，就别塞画质了（截图没有分辨率意义）
+        has_media = str(d.get("fileId")) in dirs_with_media
         title = (it or {}).get("title") or t
         year = (it or {}).get("year") or (int(y) if (y or "").isdigit() else None)
         tmdb = (it or {}).get("tmdb") or tm
-        quality = (it or {}).get("quality") or parse_quality_from_name(old)
+        # 画质取「自己的名字」优先：同一部片子常有 4K/1080P 多个版本，
+        # 目录名 `XXX.1080p.BluRay` 就是最可靠的画质证据；
+        # 只有目录名里看不出来时，才退回继承条目（文件）的画质。
+        quality = ""
+        if has_media:
+            quality = (parse_quality_from_name(old)
+                       or (it or {}).get("quality")
+                       or "")
         new = _fmt(title=title, year=year, quality=quality, tmdb=tmdb,
                    ext="", is_dir=True)
-        _push(d.get("fileId"), True, old, new, "文件夹规范化")
+        _push(d.get("fileId"), True, old, new, "文件夹规范化",
+              quality=quality, src_name=old)
 
     # ---- 文件 ----
     for f in (deep_files or []):
@@ -1584,12 +1775,24 @@ def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
         else:
             title, year, tmdb = parse_share_title(stem)
             year = int(year) if (year or "").isdigit() else None
+            # 父目录与 fileId 都没命中 → 用文件名自己再兜两层：
+            #   ① 归一化片名直接命中（`Furious Seven` ↔ `速度与激情7` 不行，但同语言可以）
+            #   ② 年份唯一时反查（`The Fast and the Furious (2001)` → 2001 只有这部，认领中文名）
+            cand = item_by_key.get(_norm_key(title or stem))
+            if cand is None and year and str(year).isdigit():
+                cand = item_by_year.get(int(year))
+            if cand is not None:
+                title, year, tmdb = _pick_identity(
+                    (title, year, tmdb),
+                    (cand.get("title"), cand.get("year"), cand.get("tmdb")))
         if not title:
             continue
-        quality = parse_quality_from_name(old) or parse_quality_from_name(pt or "")
+        quality = (parse_quality_from_name(old) or parse_quality_from_name(stem or "")
+                   or (it or {}).get("quality") or parse_quality_from_name(pt or ""))
         new = _fmt(title=title, year=year, quality=quality, tmdb=tmdb,
                    ext=ext, is_dir=False)
-        _push(f.get("fileId"), False, old, new, "文件名规范化")
+        _push(f.get("fileId"), False, old, new, "文件名规范化",
+              quality=quality, src_name=old)
     return plan
 
 
@@ -1796,6 +1999,10 @@ def parse_share_title(raw_title, is_share_title=False):
     t = re.sub(r"(国英双语|中英双语|中英字幕|国粤双语|双语字幕|内封字幕|外挂字幕|"
                r"国语|粤语|英语|中字|字幕|双语|简繁|特效|纯净|无水印|"
                r"国配|台配|导演剪辑|加长版|导剪版)", "", t, flags=re.I)
+    # 英文名里的点号当空格：`The.Fast.and.the.Furious` → `The Fast and the Furious`。
+    # 中文名不受影响（「速度与激情：特别行动」里的点是全角，不在替换范围）。
+    if not re.search(r"[\u4e00-\u9fff]", t):
+        t = t.replace(".", " ")
     t = re.sub(r"\s+", " ", t).strip(" .-_")
     return t or None, year or None, tmdb_id
 
@@ -2345,6 +2552,74 @@ def _pick_identity(self_info, dir_info):
     return title, (a[1] or b[1]), (a[2] or b[2])
 
 
+def _build_identity_maps(dir_nodes, deep_files):
+    """把分享里出现过的「片名身份」全量收集起来，供文件层反查中文名 / TMDB。
+
+    动机：`_pick_identity` 只能从「父目录」继承身份，一旦文件直接挂在分享根目录
+    （父目录名是「XX 合集」这种合集名，解析不出单片身份），中文片名和 TMDB 就全丢了，
+    重命名后变成 `The.Fast.and.the.Furious (2001)....mkv` 这种半截名字。
+
+    于是这里建两张表：
+      map_year       year      → (title, year, tmdb)      年份在整份分享里唯一时最可靠
+      map_norm_title 归一化片名 → (title, year, tmdb)      英文原名 ↔ 中文名的桥
+
+    只在「该年份/片名在整份分享里唯一」时才写入，避免把 Reloaded / Revolutions
+    这类同年的不同片子张冠李戴。
+    """
+    def _ident(name):
+        t, y, tm = parse_share_title(name or "")
+        if not t:
+            return None
+        return (t, int(y) if (y or "").isdigit() else None, tm)
+
+    pool = []
+    for d in (dir_nodes or []):
+        nm = (d.get("fileName") or "").strip()
+        if is_junk_title(nm) or is_collection_title(nm):
+            continue
+        if not looks_like_single_title(nm):
+            continue
+        idt = _ident(nm)
+        if idt:
+            pool.append(idt)
+    for f in (deep_files or []):
+        nm = (f.get("fileName") or "").strip()
+        if (f.get("ext") or Path(nm).suffix or "").lower() not in MEDIA_EXTS:
+            continue
+        idt = _ident(Path(nm).stem)
+        if idt and idt[2]:          # 文件名自带 tmdb 的才可信
+            pool.append(idt)
+
+    def _pick(a, b):
+        """两个身份里挑信息更全的：有中文名 > 有 tmdb > 名字里带序号。
+
+        同一个年份有多条记录时优先用带序号的（「速度与激情 1」胜过「速度与激情」，
+        否则第一部会被写成没有序号的裸名，和整个系列对不上）。
+        """
+        def score(x):
+            base, year = x[0], x[1]
+            has_seq = 1 if re.search(r"\d+\s*$", base or "") else 0
+            return (1 if re.search(r"[\u4e00-\u9fff]", base or "") else 0,
+                    1 if x[2] else 0, has_seq, 1 if year else 0)
+        return a if score(a) >= score(b) else b
+
+    by_year, by_title = {}, {}
+    year_cnt, title_cnt = {}, {}
+    for t, y, tm in pool:
+        k = norm_title(t)
+        if y:
+            year_cnt[y] = year_cnt.get(y, 0) + 1
+        if k:
+            title_cnt[k] = title_cnt.get(k, 0) + 1
+    for t, y, tm in pool:
+        k = norm_title(t)
+        if y and year_cnt.get(y) == 1:
+            by_year[y] = _pick(by_year[y], (t, y, tm)) if y in by_year else (t, y, tm)
+        if k and title_cnt.get(k) == 1:
+            by_title[k] = _pick(by_title[k], (t, y, tm)) if k in by_title else (t, y, tm)
+    return by_year, by_title
+
+
 def collect_media_items(deep_files, dir_nodes=None):
     """把递归列出的文件整理成影视条目（去重：同片不同后缀/分卷只算一个）。
     返回 [{file, name, title, year, tmdb, quality, ext, size}]，已按年份排序。
@@ -2353,6 +2628,7 @@ def collect_media_items(deep_files, dir_nodes=None):
     文件大小字段兼容 fileSize / size；片名优先取「父目录名」里的中文片名与
     {tmdb-id}（很多合集是 每部片一个文件夹，里面才是英文原名的 mkv）。
     """
+    map_year, map_title = _build_identity_maps(dir_nodes, deep_files)
     raw = []
     for f in deep_files or []:
         name = (f.get("fileName") or "").strip()
@@ -2366,6 +2642,17 @@ def collect_media_items(deep_files, dir_nodes=None):
             parse_share_title(base),
             (f.get("_dir_title"), f.get("_dir_year"), f.get("_dir_tmdb")),
         )
+        # 父目录没给出身份（或给得残缺）时，拿全量映射表兜底，
+        # 补上中文片名 / 年份 / tmdb-id
+        if not title or not tmdb:
+            _cand = None
+            if year and str(year).isdigit():
+                _cand = map_year.get(int(year))
+            if _cand is None:
+                _cand = map_title.get(norm_title(title or base))
+            if _cand:
+                title, year, tmdb = _pick_identity(
+                    (title, year, tmdb), _cand)
         # 画质：文件名优先，没有再看父目录名（如 “- 4K REMUX”）
         qual = parse_quality_from_name(name)
         if not qual and f.get("_dir_title"):
