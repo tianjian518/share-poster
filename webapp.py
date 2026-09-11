@@ -92,7 +92,8 @@ def api_generate():
 
 
 # ---------------- 光鸭云盘账号 ----------------
-LOGIN_SESSIONS = {}        # phone -> GuangyaAccount（等待验证码的阶段）
+LOGIN_SESSIONS = {}        # phone -> {account, captcha_token, verification_id}
+_SESSION_LOCK = threading.Lock()
 
 
 @app.route("/api/account/status")
@@ -100,30 +101,66 @@ def api_account_status():
     acc = GuangyaAccount.from_config()
     if not acc.logged_in:
         return jsonify({"ok": True, "logged_in": False})
-    name, days = "", guangya_token_days_left(acc)
+    name, days, err = "", guangya_token_days_left(acc), ""
     try:
         info = acc.user_info()
         d = info.get("data") or info
         name = d.get("nickname") or d.get("name") or d.get("phone") or ""
-    except Exception:                                  # noqa: BLE001
-        pass
+    except Exception as e:                             # noqa: BLE001
+        err = str(e)[:120]
     return jsonify({"ok": True, "logged_in": True, "name": str(name),
-                    "days": round(days, 1) if days is not None else None})
+                    "days": round(days, 1) if days is not None else None,
+                    "warn": ("登录态校验失败：" + err) if err else ""})
 
 
-@app.route("/api/account/login/sms", methods=["POST"])
-def api_account_login_sms():
-    """第一步：发短信验证码"""
+@app.route("/api/account/sms/send", methods=["POST"])
+def api_account_sms_send():
+    """第 1 步：点「发送验证码」→ 真的把短信发出去"""
     data = request.get_json(force=True, silent=True) or {}
     phone = (data.get("phone") or "").strip()
     if not phone:
         return jsonify({"ok": False, "error": "请填手机号（含区号，如 +86 13800138000）"})
     acc = GuangyaAccount()
     try:
-        acc.login_sms(phone, get_code=lambda _v: (data.get("code") or "").strip())
+        st = acc.start_sms_login(phone)
     except Exception as e:                             # noqa: BLE001
-        return jsonify({"ok": False, "error": f"登录失败：{e}"})
+        return jsonify({"ok": False, "error": f"发送失败：{str(e)[:180]}"})
+    if not st.get("ok"):
+        # 需要人机验证时，把 url 交给前端打开
+        return jsonify({"ok": False, "need_captcha": True,
+                        "url": st.get("url") or "",
+                        "error": ("需要在浏览器完成人机验证后再试"
+                                  if st.get("need_captcha")
+                                  else f"发送失败：{str(st.get('raw'))[:180]}")})
+    with _SESSION_LOCK:
+        LOGIN_SESSIONS[phone] = {"account": acc, "sms": st}
+    return jsonify({"ok": True, "msg": "验证码已发送，请查收短信"})
+
+
+@app.route("/api/account/sms/verify", methods=["POST"])
+def api_account_sms_verify():
+    """第 2 步：填验证码 → 完成登录"""
+    data = request.get_json(force=True, silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    code = (data.get("code") or "").strip()
+    if not phone or not code:
+        return jsonify({"ok": False, "error": "手机号和验证码都要填"})
+    with _SESSION_LOCK:
+        sess = LOGIN_SESSIONS.get(phone)
+    if not sess:
+        return jsonify({"ok": False,
+                        "error": "还没发过验证码（或服务重启了），请先点「发送验证码」"})
+    acc, st = sess["account"], sess["sms"]
+    try:
+        acc.finish_sms_login(phone, code, st["captcha_token"],
+                             st["verification_id"])
+    except Exception as e:                             # noqa: BLE001
+        return jsonify({"ok": False, "error": f"登录失败：{str(e)[:180]}"})
+    if not acc.logged_in:
+        return jsonify({"ok": False, "error": "登录未返回 token，请重试"})
     acc.save_to_config()
+    with _SESSION_LOCK:
+        LOGIN_SESSIONS.pop(phone, None)
     name = ""
     try:
         info = acc.user_info()
@@ -147,16 +184,20 @@ def api_account_login_token():
         try:
             acc.refresh_token()
         except Exception as e:                         # noqa: BLE001
-            return jsonify({"ok": False, "error": f"用 refresh_token 换取失败：{e}"})
+            return jsonify({"ok": False, "error": f"用 refresh_token 换取失败：{str(e)[:180]}"})
+    if not acc.logged_in:
+        return jsonify({"ok": False, "error": "没有拿到有效 token"})
     name, warn = "", ""
     try:
         info = acc.user_info()
         d = info.get("data") or info
         name = d.get("nickname") or d.get("name") or d.get("phone") or ""
     except Exception as e:                             # noqa: BLE001
-        warn = f"（token 可能无效：{e}）"
+        warn = f"token 可能无效：{str(e)[:140]}"
+    if warn:
+        return jsonify({"ok": False, "error": warn})
     acc.save_to_config()
-    return jsonify({"ok": True, "logged_in": True, "name": str(name), "warn": warn})
+    return jsonify({"ok": True, "logged_in": True, "name": str(name)})
 
 
 @app.route("/api/account/logout", methods=["POST"])
@@ -428,7 +469,14 @@ PAGE = r"""<!doctype html>
 
     <div id="tab_sms">
       <input id="lg_phone" placeholder="手机号（含区号，如 +86 13800138000）">
-      <input id="lg_code" placeholder="收到的 6 位验证码">
+      <div style="display:flex;gap:8px;align-items:flex-start">
+        <input id="lg_code" placeholder="收到的验证码" style="flex:1;margin-bottom:10px">
+        <button class="btn blue" id="lg_send_code"
+          style="padding:11px 14px;font-size:13px;white-space:nowrap;flex:0 0 auto">
+          发送验证码
+        </button>
+      </div>
+      <div class="cap" id="lg_tip" style="margin-bottom:10px"></div>
       <div class="row">
         <button class="btn ghost" id="lg_cancel">取消</button>
         <button class="btn primary" id="lg_sms_go">登录</button>
@@ -438,6 +486,7 @@ PAGE = r"""<!doctype html>
     <div id="tab_token" class="hidden">
       <input id="lg_token" placeholder="access_token">
       <input id="lg_refresh" placeholder="refresh_token（选填，填了能自动续期）">
+      <div class="cap" id="lg_tip2" style="margin-bottom:10px"></div>
       <div class="row">
         <button class="btn ghost" id="lg_cancel2">取消</button>
         <button class="btn primary" id="lg_token_go">保存登录态</button>
@@ -637,6 +686,8 @@ $('#acct_btn').onclick = async () => {
     toast('已退出光鸭登录');
     return;
   }
+  lgTip('');
+  const t2 = $('#lg_tip2'); if(t2) t2.style.display = 'none';
   $('#login_modal').classList.add('show');
 };
 $('#lg_cancel').onclick = () => $('#login_modal').classList.remove('show');
@@ -653,22 +704,65 @@ document.querySelectorAll('.tabs button').forEach(b => {
   };
 });
 
+let sendTimer = null;
+
+function lgTip(msg, kind){
+  const t = $('#lg_tip');
+  if(!msg){ t.style.display = 'none'; return; }
+  t.className = 'cap ' + (kind === 'bad' ? 'bad' : 'good');
+  t.innerHTML = msg;
+  t.style.display = 'block';
+}
+
+$('#lg_send_code').onclick = async () => {
+  const phone = $('#lg_phone').value.trim();
+  if(!phone){ toast('请先填手机号'); return; }
+  const btn = $('#lg_send_code');
+  btn.disabled = true;
+  lgTip('正在发送…');
+  try{
+    const d = await (await fetch('/api/account/sms/send',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({phone})})).json();
+    if(!d.ok){
+      lgTip(d.error || '发送失败', 'bad');
+      if(d.need_captcha && d.url){
+        lgTip((d.error||'') + '<br><a href="' + d.url + '" target="_blank">点这里完成人机验证</a>', 'bad');
+      }
+      btn.disabled = false;
+      return;
+    }
+    lgTip('✅ 验证码已发送，请查收短信');
+    let n = 60;
+    btn.textContent = n + 's';
+    clearInterval(sendTimer);
+    sendTimer = setInterval(() => {
+      n--;
+      if(n <= 0){ clearInterval(sendTimer); btn.disabled = false; btn.textContent = '发送验证码'; }
+      else btn.textContent = n + 's';
+    }, 1000);
+  }catch(e){
+    lgTip('请求失败：' + e, 'bad');
+    btn.disabled = false;
+  }
+};
+
 $('#lg_sms_go').onclick = async () => {
   const phone = $('#lg_phone').value.trim();
   const code  = $('#lg_code').value.trim();
   if(!phone){ toast('请填手机号'); return; }
-  if(!code){ toast('请填收到的验证码（先去光鸭 App/短信取）'); return; }
+  if(!code){ toast('请填收到的验证码'); return; }
   $('#lg_sms_go').disabled = true;
-  toast('正在登录…');
+  lgTip('正在登录…');
   try{
-    const d = await (await fetch('/api/account/login/sms',{method:'POST',
+    const d = await (await fetch('/api/account/sms/verify',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({phone, code})})).json();
-    if(!d.ok){ toast(d.error || '登录失败'); return; }
+    if(!d.ok){ lgTip(d.error || '登录失败', 'bad'); return; }
     $('#login_modal').classList.remove('show');
     await refreshAccount();
     toast('✅ 登录成功，可以重命名啦');
-  }catch(e){ toast('请求失败：' + e); }
+  }catch(e){ lgTip('请求失败：' + e, 'bad'); }
   finally{ $('#lg_sms_go').disabled = false; }
 };
 
@@ -681,13 +775,14 @@ $('#lg_token_go').onclick = async () => {
     const d = await (await fetch('/api/account/login/token',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({access_token:tk, refresh_token:rf})})).json();
-    if(!d.ok){ toast(d.error || '登录失败'); return; }
-    if(d.warn) toast(d.warn);
-    else{
-      $('#login_modal').classList.remove('show');
-      await refreshAccount();
-      toast('✅ 登录态已保存');
+    if(!d.ok){
+      const t = $('#lg_tip2'); t.className = 'cap bad';
+      t.innerHTML = d.error || '登录失败'; t.style.display = 'block';
+      return;
     }
+    $('#login_modal').classList.remove('show');
+    await refreshAccount();
+    toast('✅ 登录态已保存');
   }catch(e){ toast('请求失败：' + e); }
   finally{ $('#lg_token_go').disabled = false; }
 };

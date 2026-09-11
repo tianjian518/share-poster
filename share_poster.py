@@ -45,7 +45,7 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
@@ -1128,7 +1128,7 @@ class GuangyaAccount:
     """光鸭云盘账号客户端。
 
     能力：
-      · 短信登录（init → send → verify → signin 四步，参考 guangyaclient）
+      · 短信登录（init → send → verify → signin 四步）
       · 手动贴 access_token / refresh_token
       · token 自动持久化到 ~/.share_poster.json（含过期时间）
       · 文件操作：列目录 / 重命名 / 取详情（用于给自己的分享内文件改名）
@@ -1136,11 +1136,19 @@ class GuangyaAccount:
     接口分两个域：
       · account.guangyapan.com —— 登录鉴权
       · api.guangyapan.com/nd.bizuserres.s/v1 —— 文件/分享操作
+
+    协议细节严格对齐 guangyaclient（DDSRem-Dev），关键点：
+      · x-device-sign = f"wdi10.{did}" + 32 位随机 hex（少这段会被风控拒绝）
+      · user_info 只带基础头 + authorization，不要带 x-device-* 全套
+      · 所有业务请求统一带 traceparent（W3C 格式）
     """
 
     ACCOUNT_BASE = "https://account.guangyapan.com"
     API_BASE = "https://api.guangyapan.com/nd.bizuserres.s/v1"
     CLIENT_ID = "aMe-8VSlkrbQXpUR"
+    UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/147.0.0.0 Safari/537.36")
 
     def __init__(self, access_token=None, refresh_token=None, device_id=None):
         self.token = access_token or ""
@@ -1155,10 +1163,10 @@ class GuangyaAccount:
             "dt": "4",
             "origin": "https://www.guangyapan.com",
             "referer": "https://www.guangyapan.com/",
-            "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/120.0.0.0 Safari/537.36"),
+            "user-agent": self.UA,
         })
+        if self.token:
+            self.session.headers["authorization"] = f"Bearer {self.token}"
 
     # ---- 基础设施 ----
     @staticmethod
@@ -1172,51 +1180,54 @@ class GuangyaAccount:
         import secrets as _s
         return f"00-{_s.token_hex(16)}-{_s.token_hex(8)}-01"
 
-    def _account_headers(self, with_token=False):
-        h = {
+    def _account_headers(self):
+        """登录鉴权用头（含 x-device-* 全套；不带 authorization，
+        否则空 Bearer 会被服务端判为 bad authorization format）"""
+        import secrets as _s
+        return {
             "accept": "*/*",
             "content-type": "application/json",
             "origin": "https://www.guangyapan.com",
             "referer": "https://www.guangyapan.com/",
+            "user-agent": self.UA,
             "x-client-id": self.CLIENT_ID,
             "x-client-version": "0.0.1",
             "x-device-id": self.device_id,
-            "x-device-model": "chrome%2F120.0.0.0",
+            "x-device-model": "chrome%2F147.0.0.0",
             "x-device-name": "PC-Chrome",
-            "x-device-sign": f"wdi10.{self.device_id}",
+            # 关键：did 后面必须再拼 32 位随机 hex，否则服务端认为签名无效
+            "x-device-sign": f"wdi10.{self.device_id}{_s.token_hex(16)}",
             "x-net-work-type": "NONE",
-            "x-os-version": "Win32",
+            "x-os-version": "MacIntel",
             "x-platform-version": "1",
             "x-protocol-version": "301",
             "x-provider-name": "NONE",
             "x-sdk-version": "9.0.2",
-            "user-agent": self.session.headers["user-agent"],
         }
-        if with_token and self.token:
-            h["authorization"] = f"Bearer {self.token}"
-        return h
 
     # ---- 登录：短信流程 ----
-    def login_sms_init(self, phone):
-        """第一步：初始化验证码（可能返回 captcha_token 或人机验证 url）"""
+    def login_sms_init(self, phone, captcha_token=None):
+        """第一步：初始化验证码（返回 captcha_token 或人机验证 url）"""
         body = {
             "client_id": self.CLIENT_ID,
             "action": "POST:/v1/auth/verification",
             "device_id": self.device_id,
             "meta": {"phone_number": phone},
         }
+        if captcha_token:
+            body["captcha_token"] = captcha_token
         r = self.session.post(f"{self.ACCOUNT_BASE}/v1/shield/captcha/init",
                               headers=self._account_headers(), json=body, timeout=20)
         r.raise_for_status()
         return r.json()
 
-    def login_sms_send(self, phone, captcha_token):
+    def login_sms_send(self, phone, captcha_token, target="ANY"):
         """第二步：发送短信验证码"""
         h = self._account_headers()
         h["x-captcha-token"] = captcha_token
         r = self.session.post(f"{self.ACCOUNT_BASE}/v1/auth/verification",
                               headers=h,
-                              json={"phone_number": phone, "target": "ANY",
+                              json={"phone_number": phone, "target": target,
                                     "client_id": self.CLIENT_ID}, timeout=20)
         r.raise_for_status()
         return r.json()
@@ -1246,6 +1257,29 @@ class GuangyaAccount:
         r.raise_for_status()
         return self._apply_token(r.json())
 
+    def start_sms_login(self, phone):
+        """登录第 1 步（Web 拆步骤用）：发验证码，返回 {
+        captcha_token, verification_id, need_captcha, url }"""
+        init = self.login_sms_init(phone)
+        ct = init.get("captcha_token")
+        if not ct:
+            return {"ok": False, "need_captcha": True,
+                    "url": init.get("url") or init.get("captcha_url") or "",
+                    "raw": init}
+        send = self.login_sms_send(phone, ct)
+        vid = send.get("verification_id")
+        if not vid:
+            return {"ok": False, "raw": send}
+        return {"ok": True, "captcha_token": ct, "verification_id": vid}
+
+    def finish_sms_login(self, phone, code, captcha_token, verification_id):
+        """登录第 2 步（Web 拆步骤用）：提交验证码完成登录"""
+        ver = self.login_sms_verify(verification_id, code)
+        vtok = ver.get("verification_token")
+        if not vtok:
+            raise RuntimeError(f"验证码校验失败：{str(ver)[:200]}")
+        return self.login_sms_signin(code, vtok, phone, captcha_token)
+
     def _apply_token(self, result):
         """把登录/刷新返回的 token 落进实例"""
         if not isinstance(result, dict):
@@ -1262,24 +1296,16 @@ class GuangyaAccount:
         return result
 
     def login_sms(self, phone, get_code=None):
-        """短信登录全流程。get_code 为取验证码的回调（Web 场景由前端传）。"""
-        init = self.login_sms_init(phone)
-        captcha = init.get("captcha_token")
-        if not captcha:
-            raise RuntimeError(f"初始化验证码失败：{init}")
-        send = self.login_sms_send(phone, captcha)
-        vid = send.get("verification_id")
-        if not vid:
-            raise RuntimeError(f"发送验证码失败：{send}")
+        """短信登录全流程（CLI 用）。get_code 为取验证码的回调。"""
+        st = self.start_sms_login(phone)
+        if not st.get("ok"):
+            raise RuntimeError(f"发送验证码失败：{str(st.get('raw'))[:200]}")
         if get_code is None:
             def get_code():
                 return input("请输入短信验证码: ")
         code = get_code()
-        ver = self.login_sms_verify(vid, code)
-        vtok = ver.get("verification_token")
-        if not vtok:
-            raise RuntimeError(f"验证码校验失败：{ver}")
-        return self.login_sms_signin(code, vtok, phone, captcha)
+        return self.finish_sms_login(phone, code,
+                                     st["captcha_token"], st["verification_id"])
 
     def refresh_token(self):
         """用 refresh_token 换新的 access_token"""
@@ -1295,19 +1321,35 @@ class GuangyaAccount:
         return self._apply_token(r.json())
 
     def user_info(self):
-        """获取当前登录用户信息"""
-        r = self.session.post(
-            f"{self.ACCOUNT_BASE}/v1/user/me",
-            headers=self._account_headers(with_token=True), timeout=20)
+        """获取当前登录用户信息（只带基础头 + authorization）"""
+        if not self.token:
+            raise RuntimeError("未登录：token 为空")
+        h = {
+            "accept": "*/*",
+            "content-type": "application/json",
+            "origin": "https://www.guangyapan.com",
+            "referer": "https://www.guangyapan.com/",
+            "user-agent": self.UA,
+            "authorization": f"Bearer {self.token}",
+        }
+        # 注意：这个接口是 GET，用 POST 会返回 501 Method Not Allowed
+        r = self.session.get(f"{self.ACCOUNT_BASE}/v1/user/me",
+                             headers=h, timeout=20)
         r.raise_for_status()
         return r.json()
 
     # ---- 业务 API（自动带 token / 401 自动刷新）----
     def _post_api(self, path, payload, _retried=False):
-        h = {"traceparent": self._traceparent(),
-             "authorization": f"Bearer {self.token}"}
-        r = self.session.post(f"{self.API_BASE}/{path}", json=payload,
-                              headers=h, timeout=30)
+        url = path if path.startswith("http") else f"{self.API_BASE}/{path}"
+        h = {"traceparent": self._traceparent()}
+        # 先看本地过期时间，过期就主动续期
+        if self.refresh_token_value and self.expires_at \
+                and time.time() >= self.expires_at and not _retried:
+            try:
+                self.refresh_token()
+            except Exception:                       # noqa: BLE001
+                pass
+        r = self.session.post(url, json=payload, headers=h, timeout=30)
         if r.status_code == 401 and self.refresh_token_value and not _retried:
             self.refresh_token()
             return self._post_api(path, payload, _retried=True)
@@ -1316,22 +1358,23 @@ class GuangyaAccount:
         if isinstance(data, dict) and data.get("code") not in (0, None) \
                 and data.get("msg") not in ("success", None):
             raise RuntimeError(f"接口异常：{str(data)[:200]}")
-        return data.get("data", data) if isinstance(data, dict) else data
+        return data
 
     def fs_rename(self, file_id, new_name):
-        """重命名文件/文件夹"""
-        return self._post_api("rename", {"fileId": str(file_id),
-                                         "newName": new_name})
+        """重命名文件/文件夹（注意路径是 file/rename）"""
+        return self._post_api("file/rename",
+                              {"fileId": str(file_id), "newName": new_name})
 
-    def fs_list(self, parent_id="", page_size=100):
+    def fs_list(self, parent_id="", page=0, page_size=100):
         """列出某目录下的文件（parentId 为空 = 根目录）"""
-        return self._post_api("get_file_list", {
-            "pageSize": page_size, "orderBy": 0, "sortType": 0,
-            "parentId": "" if parent_id is None else str(parent_id)})
+        return self._post_api("file/get_file_list", {
+            "parentId": "" if parent_id is None else str(parent_id),
+            "page": page, "pageSize": page_size,
+            "orderBy": 0, "sortType": 0})
 
     def fs_detail(self, file_id):
         """获取文件详情"""
-        return self._post_api("get_file_detail", {"fileId": str(file_id)})
+        return self._post_api("file/get_file_detail", {"fileId": str(file_id)})
 
     # ---- 持久化 ----
     def save_to_config(self, extra=None):

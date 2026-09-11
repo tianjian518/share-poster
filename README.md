@@ -200,6 +200,28 @@ python3 share_poster.py --rename "分享链接" -o ./out
 > ⚠️ 重命名是**直接改你自己网盘里的文件**，不可撤销。所以默认只预览，
 > 必须手动确认（弹窗里勾选 + 二次确认）才会真正执行。
 
+## v1.1.1 (2026-09-11)
+
+**修复登录完全不可用的问题**（v1.1.0 的登录是坏的，抱歉）。对照
+[guangyaclient](https://github.com/DDSRem-Dev/guangyaclient) 逐行核对协议后修正 8 处：
+
+| 问题 | 错误写法 | 修正后 |
+| ---- | ---- | ---- |
+| `x-device-sign` 缺随机串，被风控拒绝 | `wdi10.{did}` | `wdi10.{did}{32位随机hex}` |
+| 空 `Authorization: Bearer ` 导致 401 | session 预置空 token 头 | 有 token 才加 |
+| `user_info` 用了 POST | POST（返回 501） | **GET** |
+| `fs_rename` 路径错 | `rename` | `file/rename` |
+| `fs_list` 路径错 | `get_file_list` | `file/get_file_list` |
+| `fs_detail` 路径错 | `get_file_detail` | `file/get_file_detail` |
+| `x-device-model` / `x-os-version` 不匹配 | `chrome%2F120` / `Win32` | `chrome%2F147` / `MacIntel` |
+| 短信登录塞在一个请求里，没有"发验证码"这一步 | 一次调用走完全程 | **拆成两步**：发验证码 → 填码登录 |
+
+另外：
+- 网页登录弹窗新增**「发送验证码」按钮**，带 60 秒倒计时
+- 登录失败会在弹窗内直接显示服务端返回的原因（不再只弹个 toast）
+- 需要人机验证时，界面会给出验证链接
+- 新增 `GuangyaAccount.start_sms_login()` / `finish_sms_login()`，便于分步调用
+
 ## v1.1.0 (2026-09-11)
 
 - 新增**光鸭云盘账号登录**：短信验证码 + 手动贴 Token，两种都支持
