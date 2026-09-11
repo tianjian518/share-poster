@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -44,10 +45,16 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.0.4"
+VERSION = "1.0.7"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
+
+# 目录递归遍历上限（合集可能有几十上百个子目录）
+MAX_WALK_DEPTH = 8        # 最大层数
+MAX_WALK_NODES = 1200     # 最多展开多少个节点
+MAX_WALK_FILES = 600      # 最多收集多少个文件
+WALK_WORKERS = 6          # 并发列目录线程数
 
 # 常见网盘识别规则
 CLOUD_PATTERNS = [
@@ -250,6 +257,97 @@ class CloudShareFetcher:
             raise RuntimeError(f"接口返回异常: {str(data)[:200]}")
         return data["data"]
 
+    # --- 目录遍历 ------------------------------------------------------
+    # 光鸭接口里 dirType 不可靠（视频文件的 dirType 也可能是 1），
+    # 真正能区分文件的是：文件节点带 ext / fileSize / mineType，且 resType=1；
+    # 目录节点 resType=2 且没有这些字段。
+    @staticmethod
+    def _is_file(node):
+        if node.get("ext") or node.get("fileSize") or node.get("mineType"):
+            return True
+        return node.get("resType") == 1
+
+    def _list_dir(self, token, parent_id, retries=2):
+        """列出某目录的子节点，失败自动重试（分享接口偶发超时/限流）"""
+        last = None
+        for _ in range(retries + 1):
+            try:
+                data = self._post_json("get_share_page_files_list", {
+                    "pageSize": 100, "accessToken": token,
+                    "orderBy": 0, "sortType": 0, "parentId": parent_id or "",
+                })
+                return data.get("list") or []
+            except Exception as e:      # noqa: BLE001
+                last = e
+                time.sleep(0.3)
+        raise last
+
+    def _walk(self, token, roots, max_depth=MAX_WALK_DEPTH,
+              max_nodes=MAX_WALK_NODES, max_files=MAX_WALK_FILES,
+              workers=WALK_WORKERS):
+        """层序（BFS）+ 并发遍历分享目录树。
+
+        返回 (leaves, dirs)：
+          leaves —— 文件节点，附加父目录解析出的片名/年份/tmdb
+                    （_self_* 自身解析，_dir_* 最近一层「像片名」的父目录解析）
+          dirs   —— 目录节点（含顶层），用于文件层拿不到时的兜底识别
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        def with_meta(node, pt=("", None, None)):
+            n = dict(node)
+            name = node.get("fileName") or ""
+            t, y, tm = parse_share_title(name)
+            n["_self_title"], n["_self_year"], n["_self_tmdb"] = t, y, tm
+            # 父链信息：自身解析不出年份/tmdb 时继承父目录
+            n["_dir_title"], n["_dir_year"], n["_dir_tmdb"] = pt
+            return n
+
+        level, dirs, leaves = [], [], []
+        for f in roots or []:
+            n = with_meta(f)
+            level.append(n)
+            if not self._is_file(n):
+                dirs.append(n)
+            else:
+                leaves.append(n)
+
+        # 注意：seen 只记录「已经展开过」的目录，顶层目录本身还没展开
+        seen = set()
+        for _depth in range(max_depth):
+            pend = [n for n in level
+                    if (not self._is_file(n)) and n.get("fileId")
+                    and n.get("fileId") not in seen]
+            if not pend:
+                break
+            for n in pend:
+                seen.add(n.get("fileId"))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                children = list(ex.map(
+                    lambda n: self._list_dir(token, n.get("fileId")), pend))
+
+            nxt = []
+            for parent, kids in zip(pend, children):
+                pname = parent.get("fileName") or ""
+                pt, py, ptm = parse_share_title(pname)
+                # 父目录名本身不像一部片（如「速度与激情 合集」「MP4&MKV」）时，
+                # 不要把合集名当成子文件的片名，改为继承更上层的有效身份
+                if not looks_like_single_title(pname):
+                    pt = parent.get("_dir_title")
+                    py = parent.get("_dir_year")
+                    ptm = parent.get("_dir_tmdb")
+                for c in kids:
+                    n = with_meta(c, (pt, py, ptm))
+                    if self._is_file(n):
+                        leaves.append(n)
+                    else:
+                        dirs.append(n)
+                        nxt.append(n)
+            level = nxt
+            if len(leaves) >= max_files or len(dirs) + len(leaves) >= max_nodes:
+                break
+        return leaves, dirs
+
     def _fetch_guangya(self, share):
         """光鸭云盘：shareId 在 /s/<shareId> 里"""
         share_id = share["url"].rsplit("/s/", 1)[-1].strip("/")
@@ -268,31 +366,18 @@ class CloudShareFetcher:
         result["share_id"] = share_id
         result["files"] = []      # 顶层
         result["deep_files"] = []  # 递归展开后的叶子文件（视频/资源文件）
+        result["dir_nodes"] = []   # 递归展开后的目录节点
 
         # 递归列出目录：分享里常是「合集文件夹」套多层子文件夹
         try:
             token = self._post_json("get_share_access_token", {"shareId": share_id})["accessToken"]
-            root = self._post_json("get_share_page_files_list", {
-                "pageSize": 100, "accessToken": token,
-                "orderBy": 0, "sortType": 0, "parentId": "",
-            })
-            result["files"] = root.get("list") or []
-            leaves, budget = [], 60
-            stack = [(f, 0) for f in reversed(result["files"])]
-            while stack and budget > 0:
-                node, depth = stack.pop()
-                budget -= 1
-                if node.get("dirType") == 1 and depth < 3:
-                    sub = self._post_json("get_share_page_files_list", {
-                        "pageSize": 100, "accessToken": token,
-                        "orderBy": 0, "sortType": 0, "parentId": node.get("fileId"),
-                    })
-                    for ch in reversed(sub.get("list") or []):
-                        stack.append((ch, depth + 1))
-                elif node.get("dirType") != 1:
-                    leaves.append(node)
+            root = self._list_dir(token, "")
+            result["files"] = root
+            leaves, dirs = self._walk(token, root)
             result["deep_files"] = leaves
-        except Exception:
+            result["dir_nodes"] = dirs
+        except Exception as e:      # noqa: BLE001
+            sys.stderr.write(f"[目录遍历失败] {e}\n")
             result["files"] = result.get("files") or []
         return result
 
@@ -323,15 +408,36 @@ class TMDBWebClient:
         m = re.search(r'<meta property="og:%s" content="([^"]*)"' % re.escape(prop), html)
         return m.group(1) if m else None
 
-    def _fetch_page(self, url, retry=2):
+    # TMDB 网页端对无 key 的抓取有频控（高并发会 429），做全局节流 + 退避
+    _throttle_lock = None
+    _last_req = [0.0]
+    MIN_INTERVAL = 0.35                          # 最小请求间隔（秒）
+
+    def _fetch_page(self, url, retry=3):
+        import threading as _th
+        import time as _t
+        if TMDBWebClient._throttle_lock is None:
+            TMDBWebClient._throttle_lock = _th.Lock()
         last = None
-        for _ in range(retry + 1):
+        for attempt in range(retry + 1):
+            with TMDBWebClient._throttle_lock:
+                wait = TMDBWebClient.MIN_INTERVAL - (_t.time() - TMDBWebClient._last_req[0])
+                if wait > 0:
+                    _t.sleep(wait)
+                TMDBWebClient._last_req[0] = _t.time()
             try:
                 r = self.session.get(url, timeout=20)
+                if r.status_code == 429:
+                    # 退避后重试（1.5s, 3s, 4.5s…）
+                    _t.sleep(1.5 * (attempt + 1))
+                    last = RuntimeError("429 Too Many Requests")
+                    continue
                 r.raise_for_status()
                 return r.text
-            except Exception as e:
+            except Exception as e:               # noqa: BLE001
                 last = e
+                if "429" in str(e):
+                    _t.sleep(1.5 * (attempt + 1))
         raise last
 
     @staticmethod
@@ -421,29 +527,51 @@ class TMDBWebClient:
         return last_info
 
     def search_by_name(self, query, year=None):
-        """无 Key：抓 TMDB 站内搜索页，解析候选 (title, id, media_type, year)。
-        返回列表 [{title,id,type,year,date,overview}]"""
+        """无 Key：抓 TMDB 站内搜索页（服务端渲染），解析候选 (title, id, type)。
+        返回列表 [{title,id,type,year,date,overview}]
+
+        注意：新版 TMDB 搜索页结果链接为 `/movie/<id>-<english-slug>`，
+        片名在 slug 里（不是锚文本，锚文本是空的图卡）。旧版正则
+        `href="/movie/(\\d+)"[^>]*>标题<` 已匹配不到任何结果。
+        """
         url = f"{self.BASE}/search?query={requests.utils.quote(query)}"
-        if year:
-            url += f"&year={year}"
         try:
             html = self._fetch_page(url)
         except Exception as e:
             sys.stderr.write(f"[TMDB 搜索失败] {e}\n")
             return []
         cands = []
-        # 搜索页卡片结构：<a href="/movie/123"> 附近有标题
-        for m in re.finditer(r'href="/(movie|tv)/(\d+)[^"]*"[^>]*>([^<]{1,120})<', html):
-            mt, mid, t = m.group(1), m.group(2), self._clean_title(m.group(3))
-            t = re.sub(r"\s*\((\d{4})\)\s*$", "", t).strip() or m.group(3)
-            if t.startswith("${"):
+        # 结果卡片：<a href="/movie/73-american-history-x" ...>
+        for m in re.finditer(r'href="/(movie|tv)/(\d+)-([a-z0-9\-]{0,120})"', html):
+            mt, mid, slug = m.group(1), m.group(2), m.group(3)
+            t = slug.replace("-", " ").strip()
+            if not t:
                 continue
             item = {"id": int(mid), "type": mt, "title": t}
             if item not in cands:
                 cands.append(item)
-            if len(cands) >= 8:
+            if len(cands) >= 12:
                 break
         return cands
+
+    def search_tmdb(self, query, year=None):
+        """TMDB 搜索 + 详情补全：拿到 id 后再抓详情页，返回带中文名/年份/海报的候选。
+        返回 [{id,type,title,year,poster_url,info}]"""
+        out = []
+        for c in self.search_by_name(query, year=year):
+            got = self.detail_by_id(c["id"])
+            if not got:
+                continue
+            info = got.get("info") or {}
+            out.append({
+                "id": c["id"], "type": got.get("type", c["type"]),
+                "title": info.get("title") or c["title"],
+                "year": info.get("year") or "",
+                "poster_url": got.get("poster_url") or "",
+                "info": info,
+                "_query_title": c["title"],
+            })
+        return out
 
     def _parse_detail_html(self, html, tmdb_id):
         """从 TMDB 详情页 HTML 解析出 info dict（字段兼容 PostGenerator）"""
@@ -736,6 +864,116 @@ def poster_to_png(img):
     return buf.read()
 
 
+UA_DEFAULT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def download_picture(url, timeout=20):
+    """带 UA 下载图片（部分图床拒绝 python 默认 UA），失败返回 None"""
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=timeout,
+                         headers={"User-Agent": UA_DEFAULT})
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content))
+        img.load()
+        return img
+    except Exception as e:      # noqa: BLE001
+        sys.stderr.write(f"[图片下载失败 {str(url)[:80]}] {e}\n")
+        return None
+
+
+def fit_font(text, max_w, start=64, end=20, step=4):
+    """按最大宽度挑一个能放下的字号"""
+    fs = start
+    font = None
+    while fs >= end:
+        font = PosterMaker._load_fonts(fs)[0]
+        try:
+            w = font.getlength(text)
+        except AttributeError:      # 老版本 Pillow
+            w = font.getbbox(text)[2]
+        if w <= max_w:
+            return font
+        fs -= step
+    return font or PosterMaker._load_fonts(end)[0]
+
+
+def make_text_cover(title, count, subtitle="", size=(900, 1350)):
+    """拿不到任何图片时的保底封面：暗色渐变 + 标题 + 部数"""
+    W, H = size
+    img = Image.new("RGB", (W, H), (22, 24, 30))
+    d = ImageDraw.Draw(img)
+    # 竖向渐变
+    for y in range(H):
+        t = y / float(H)
+        d.line([(0, y), (W, y)],
+               fill=(int(20 + 34 * t), int(22 + 24 * t), int(30 + 40 * t)))
+    # 装饰色块
+    d.ellipse([W - 300, -160, W + 140, 300], fill=(231, 76, 60))
+    d.ellipse([-160, H - 340, 220, H + 20], fill=(52, 60, 84))
+
+    # 标题（自动换行 + 字号自适应）
+    t = (title or "影视合集").strip()
+    max_w = W - 120
+    font = fit_font(t[:12], max_w, start=76, end=28)
+    lines = []
+    cur = ""
+    for ch in t:
+        if font.getlength(cur + ch) > max_w and cur:
+            lines.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    if cur:
+        lines.append(cur)
+    lines = lines[:3]
+
+    lh = int(font.size * 1.5)
+    y = (H - lh * (len(lines) + 2)) // 2
+    for ln in lines:
+        w = font.getlength(ln)
+        d.text(((W - w) / 2, y), ln, fill=(255, 255, 255), font=font)
+        y += lh
+
+    sub = subtitle or f"共 {count} 部"
+    fs = fit_font(sub, W - 160, start=42, end=20)
+    d.text(((W - fs.getlength(sub)) / 2, y + 16), sub, fill=(220, 220, 225),
+           font=fs)
+    return img
+
+
+def make_thumb_mosaic(thumbs, title, count, size=(900, 1350)):
+    """用网盘视频缩略图拼一张 3×3 封面（没有官方海报时的次选）"""
+    W, H = size
+    cols, rows = 3, 3
+    cw, ch = W // cols, H // rows
+    canvas = Image.new("RGB", (W, H), (18, 20, 26))
+    for idx, im in enumerate([t for t in thumbs if t][:9]):
+        im = im.convert("RGB")
+        # 居中裁剪成格子比例后填满
+        r_src, r_dst = im.width / im.height, cw / ch
+        if r_src > r_dst:
+            nw = int(im.height * r_dst)
+            im = im.crop(((im.width - nw) // 2, 0, (im.width + nw) // 2, im.height))
+        else:
+            nh = int(im.width / r_dst)
+            im = im.crop((0, (im.height - nh) // 2, im.width, (im.height + nh) // 2))
+        canvas.paste(im.resize((cw, ch), Image.LANCZOS),
+                     ((idx % cols) * cw, (idx // cols) * ch))
+
+    # 底部压一条信息条
+    d = ImageDraw.Draw(canvas)
+    bar_h = 170
+    d.rectangle([0, H - bar_h, W, H], fill=(16, 17, 21))
+    label = f"{(title or '影视合集').strip()} · 共 {count} 部"
+    font = fit_font(label, W - 80, start=56, end=24)
+    d.text(((W - font.getlength(label)) / 2, H - bar_h + 52), label,
+           fill=(255, 255, 255), font=font)
+    return canvas
+
+
 def make_collection_cover(base_poster, title, count, accent=(20, 22, 26)):
     """基于第一部电影海报合成一张合集封面：竖版 2:3，底部黑条写合集信息"""
     if base_poster is None:
@@ -763,8 +1001,13 @@ def make_collection_cover(base_poster, title, count, accent=(20, 22, 26)):
     canvas.paste(p, (0, 0))
     d = ImageDraw.Draw(canvas)
     t = (title or "影视合集").strip()
-    if len(t) > 16:
-        t = t[:16] + "…"
+    # 过长时优先在分隔符处断开（保留「XX合集」这类关键后缀），再退化为截断
+    if len(t) > 22:
+        cut = re.split(r"[·\-—|/]", t)
+        if len(cut) > 1:
+            t = cut[0].strip()
+    if len(t) > 22:
+        t = t[:22] + "…"
     label = f"{t} · 共 {count} 部"
     # 字号自适应：从 64 往下找能放下的
     fs = 64
@@ -783,28 +1026,77 @@ def make_collection_cover(base_poster, title, count, accent=(20, 22, 26)):
     return canvas
 
 
-def _try_collection_cover(items, series_name, count, size="w780"):
-    """给合集找一张封面：取最早年份且带 tmdb-id 的条目，下载其海报合成合集封面。
-    全部无 tmdb 标记则返回 None。"""
-    if not items:
-        return None
-    ordered = sorted(items, key=lambda x: (x.get("year") or 9999))
-    for it in ordered:
-        if not it.get("tmdb"):
-            continue
-        try:
-            got = TMDBWebClient().detail_by_id(it["tmdb"])
-            if got and got.get("poster_url"):
-                r = requests.get(got["poster_url"], timeout=20)
-                r.raise_for_status()
-                img = Image.open(io.BytesIO(r.content))
-                img.load()
-                cover = make_collection_cover(img, series_name, count)
-                if cover:
-                    return cover
-        except Exception:
-            continue
+def _tmdb_poster_of(tmdb_id):
+    """按 TMDB ID 抓海报图（网页抓取，无需 Key）"""
+    got = TMDBWebClient().detail_by_id(tmdb_id)
+    if got and got.get("poster_url"):
+        return download_picture(got["poster_url"])
     return None
+
+
+def _poster_for_item(it, web=None, try_search=True):
+    """给单个条目找海报：有 {tmdb-id} 直取，否则用片名站内搜索"""
+    web = web or TMDBWebClient()
+    title = it.get("title") or ""
+    if it.get("tmdb"):
+        img = _tmdb_poster_of(it["tmdb"])
+        if img is not None:
+            return img
+    if not try_search or not title:
+        return None
+    # “速度与激情 1” 这种尾部序号可能搜不到，再试去掉序号的名字
+    names = [title, re.sub(r"[\s\-_]*\d+\s*$", "", title).strip()]
+    for n in dict.fromkeys([x for x in names if x]):
+        try:
+            cands = web.search_by_name(n, year=it.get("year")) or []
+        except Exception:       # noqa: BLE001
+            cands = []
+        for c in cands[:2]:
+            img = _tmdb_poster_of(c["id"])
+            if img is not None:
+                return img
+    return None
+
+
+def pick_collection_cover(items, series_name, verbose=False):
+    """给合集找封面，多级兜底，保证一定出图：
+
+    1. 从「年份最早」那部开始依次尝试：带 {tmdb-id} 直取官方海报，
+       没有 ID 就用片名在 TMDB 站内搜索（最多试 3 部）
+    2. 都没有 → 用网盘视频缩略图拼 3×3 封面
+    3. 还没有 → 纯文字封面（暗色渐变 + 标题 + 部数）
+
+    返回 (PIL.Image, 来源说明)
+    """
+    if not items:
+        return make_text_cover(series_name, 0), "文字封面"
+
+    ordered = sorted(items, key=lambda x: (x.get("year") or 9999, x["title"]))
+    web = TMDBWebClient()
+
+    # 1) 官方海报（优先正传第一部）
+    for it in ordered[:3]:
+        img = _poster_for_item(it, web)
+        if img is not None:
+            cover = make_collection_cover(img, series_name, len(items))
+            if cover is not None:
+                how = f"TMDB#{it['tmdb']}" if it.get("tmdb") else "TMDB 搜索"
+                return cover, f"{how}（{it['title']}）"
+
+    # 2) 网盘视频缩略图拼图
+    thumbs = [download_picture(t) for t in
+              [i.get("thumb") for i in ordered if i.get("thumb")][:9]]
+    if any(thumbs):
+        return make_thumb_mosaic(thumbs, series_name, len(items)), "视频缩略图拼图"
+
+    # 4) 纯文字封面
+    return make_text_cover(series_name, len(items)), "文字封面"
+
+
+def _try_collection_cover(items, series_name, count, size="w780"):
+    """向后兼容的封面入口（只返回图，不返回来源）"""
+    cover, _src = pick_collection_cover(items, series_name)
+    return cover
 
 
 # --- 配置持久化 ----------------------------------------------------------
@@ -891,14 +1183,70 @@ def guess_quality(size_bytes):
     return "HD 高清"
 
 
-def parse_share_title(raw_title):
+# 罗马数字序号 → 阿拉伯数字（合集里常见「速度与激情 Ⅰ/Ⅱ/Ⅲ」）
+ROMAN_MAP = {
+    "Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "Ⅴ": "5",
+    "Ⅵ": "6", "Ⅶ": "7", "Ⅷ": "8", "Ⅸ": "9", "Ⅹ": "10",
+}
+
+# 英文续集关键词 → 第几部（用于把 "The.Matrix.Reloaded" 这类英文片名
+# 与中文文件夹 "黑客帝国2" 按序号对上。只作兜底匹配用）
+SEQUEL_KEYWORDS = {
+    "reloaded": 2, "revolutions": 3, "resurrections": 4, "revolution": 3,
+    "renaissance": 4, "resurgence": 2, "retaliation": 3, "redemption": 4,
+    "rising": 2, "reign": 2, "reckoning": 5, "revenge": 4, "relativity": 3,
+    "returns": 3, "ridley": 0, "the second": 2, "the third": 3,
+    "the fourth": 4, "the fifth": 5, "the last": 99, "final": 99,
+    "part ii": 2, "part iii": 3, "part iv": 4, "part v": 5,
+}
+
+
+def extract_part(title):
+    """从片名里提取续集序号（第几部）。拿不到返回 None。
+    优先级：标题里独立的阿拉伯数字(1-30) > 罗马数字 > 英文续集词。
+    注意：4 位年份不算序号（如 1999）。"""
+    if not title:
+        return None
+    m = re.search(r"(?<!\d)(\d{1,2})(?!\d)", title)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 30:
+            return n
+    for k, v in ROMAN_MAP.items():
+        if k in title:
+            return int(v)
+    lo = title.lower()
+    for w, n in SEQUEL_KEYWORDS.items():
+        if w in lo:
+            return n
+    return None
+
+# 明显不是「某一部片」的目录/容器关键词
+CONTAINER_WORDS = ("合集", "打包", "全集", "全季", "系列", "字幕", "花絮", "预告",
+                   "extras", "bonus", "featurettes", "sample", "mp4", "mkv",
+                   "sample", "补丁", "原盘", "iso", "seeds")
+
+
+def parse_share_title(raw_title, is_share_title=False):
     """从分享标题里拆 (片名, 年份, tmdb_id)。示例：
     《星球大战：曼达洛人与古古 (2026) {tmdb-1228710}》
     片名.2026.2160P  ...
+    速度与激情2 (2003) {tmdb-584} - 4K REMUX 4K
+
+    is_share_title=True 时按「分享总标题」解析：
+      · 不套用「取方括号中文」规则（该规则是给文件名用的，会把
+        【詹妮弗·康纳利】绝世美女-电影合集【42部】错切成「詹妮弗·康纳利」）
+      · 清掉【N部】【合集】等描述词后仍保留主体语义
     """
     if not raw_title:
         return None, None, None
     t = raw_title
+    if is_share_title:
+        # 【42部】【36部】这类计数标记直接删掉
+        t = re.sub(r"[\[【]\s*\d{1,3}\s*[部集]\s*[\]】]", " ", t)
+        # 【演员名】这种方括号标记：保留内容、去掉壳，避免后面被当成片名主体
+        t = re.sub(r"[\[【]([^\]】]{1,30})[\]】]", r" \1 ", t)
+        t = re.sub(r"\s+", " ", t).strip()
     tmdb_id = None
     # 兼容 {tmdb-123} / {tmdbid-123} / {tmdb_id:123} 等写法
     m = re.search(r"\{?\s*tmdb(?:[-_ ]?id)?[:_\- ]*(\d+)\s*\}?", t, re.I)
@@ -907,13 +1255,98 @@ def parse_share_title(raw_title):
         t = t.replace(m.group(0), " ")
     # 兜底清掉没被花括号包住的 tmdb 标记
     t = re.sub(r"\s*tmdb(?:[-_ ]?id)?[:_\- ]*\d+\s*", " ", t, flags=re.I)
+    # 年份：优先 (2026)，其次点分/空格分隔的 2001 / .2003.
     m = re.search(r"\((\d{4})\)", t)
+    if not m:
+        m = re.search(r"(?:^|[\s.\[_\-])((?:19|20)\d{2})(?=[\s.\]_\-]|$)", t)
     year = m.group(1) if m else ""
-    t = re.sub(r"\s*\(\d{4}\)\s*", " ", t)
+    # 先去掉带网址 / 发布组的水印括号： 【高清影视之家发布 www.HDBTHD.com】
+    t = re.sub(r"[\[【（(][^\]】）)]{0,60}(?:www\.|\.com|\.net|\.org|发布|字幕组|"
+               r"压制|转载|原创)[^\]】）)]{0,60}[\]】）)]", " ", t)
+    t = re.sub(r"(?:https?://|www\.)\S+", " ", t)
+    # 无括号的发布组水印： “高清影视之家发布” “XX字幕组压制” 等（分享标题剥壳后会露出来）
+    t = re.sub(r"^[^\u4e00-\u9fff]{0,10}[\u4e00-\u9fff]{0,12}"
+               r"(?:发布|制作|压制|出品|字幕组|影视之家)\s*", " ", t)
+    # 「演员个人作品合集」常见首字母分类前缀： “M-美国往事” “S -死亡中惊醒” → 去掉前缀
+    # 仅当短横线前是 1-2 个字母（分类字母）时去掉，避免误伤 “X战警” “T-34” 这类真片名
+    t = re.sub(r"^\s*[A-Za-z]{1,2}\s*[-–—]\s*(?=[\u4e00-\u9fff])", "", t)
+    # 文件名形如 “[速度与激情2].2.Fast.2.Furious.2003...” → 取方括号里的中文片名
+    # （仅文件名场景；分享总标题不能套用，否则会丢掉方括号外的真正片名主体）
+    if not is_share_title:
+        m0 = re.match(r"^\s*[\[【]([^\]】]{1,40})[\]】]", t)
+        if m0 and re.search(r"[\u4e00-\u9fff]", m0.group(1)):
+            t = m0.group(1)
+    t = re.sub(r"[\(\[]?\s*(?:19|20)\d{2}\s*[\)\]]?", " ", t)
+    # 去掉方括号里的音轨/字幕/版本说明： [国英多音轨+特效中文字幕] [60帧率版本][高码版]
+    t = re.sub(r"[\[【][^\]】]{0,40}(?:音轨|字幕|双语|国语|粤语|特效|简繁|"
+               r"内封|外挂|中字|帧率|高码|版本|修复|重制|Remux|HDR)"
+               r"[^\]】]{0,40}[\]】]", " ", t, flags=re.I)
     t = re.sub(r"[\{\}\[\]]", " ", t)
     t = re.sub(r"\s*\d{3,4}[Pp].*$", "", t)          # 去掉 1080P 等画质后缀
+    # 尾部序号： “(3)” “（2）” 之类（要在版本尾巴之前去掉，否则挡住匹配）
+    t = re.sub(r"[\s（(]\d{1,2}[）)]\s*$", " ", t)
+    # 去掉版本/画质尾巴： “- 4K REMUX 4K” “.BluRay.REMUX” 之类
+    t = re.sub(r"[\s.\-–—]+(?:4k|uhd|remux|hdr\d*\+?|10bit|8bit|dolby|"
+               r"web[\-\s]?dl|webrip|bluray|bdrip|dvd[rip]?|sdr|"
+               r"v\d|proper|extended|imax)[\s.\-\w]*$",
+               " ", t, flags=re.I)
+    for k, v in ROMAN_MAP.items():
+        t = t.replace(k, v)                          # Ⅰ → 1
+    # 去压制组水印与音轨/字幕标签：￡CMCT死亡骑士、国英双语、中英字幕…
+    t = re.sub(r"[￡＄$@].*$", "", t)
+    t = re.sub(r"(国英双语|中英双语|中英字幕|国粤双语|双语字幕|内封字幕|外挂字幕|"
+               r"国语|粤语|英语|中字|字幕|双语|简繁|特效|纯净|无水印|"
+               r"国配|台配|导演剪辑|加长版|导剪版)", "", t, flags=re.I)
     t = re.sub(r"\s+", " ", t).strip(" .-_")
     return t or None, year or None, tmdb_id
+
+
+def norm_title(s):
+    """片名归一化：去空格/标点，用于判断两条记录是不是同一部片"""
+    return re.sub(r"[\s\-_：:：·・.,，、]+", "", (s or "")).lower()
+
+
+def looks_like_single_title(name):
+    """这个名字看起来像「单独一部片」吗（用于判断目录能否当一部片的身份）"""
+    if not name:
+        return False
+    t, y, tm = parse_share_title(name)
+    if not t:
+        return False
+    if tm or y:
+        return True
+    lo = name.lower()
+    if any(w in lo for w in CONTAINER_WORDS):
+        return False
+    if is_collection_title(name):
+        return False
+    return len(t) <= 30
+
+
+# 蓝光原盘/播放器生成的元数据名，明显不是影片名
+JUNK_TITLE_RE = re.compile(
+    r"^(?:bdmv|certificate|auxdata|backup|movieobject|index|jar|playlist|"
+    r"stream|clipinf|playlist|discinfo|bdjo|meta|00000|0+|mpls|clpi)\b",
+    re.I,
+)
+
+
+def is_junk_title(name):
+    """明显不是影片名的条目（蓝光原盘结构名 / 纯数字 / 纯符号）"""
+    t = (name or "").strip()
+    if not t:
+        return True
+    if re.fullmatch(r"[\d\W_]+", t):          # 纯数字/符号：00000、003
+        return True
+    if JUNK_TITLE_RE.match(t):
+        return True
+    if re.search(r"(?:TV Series|S\d{2}E\d{2}|Season\s*\d)", t, re.I):
+        return True
+    low = t.lower()
+    if low in ("index", "movieobject", "auxdata", "bdmv", "backup", "certificate",
+               "sound", "movieobject.bdmv", "sound.bdmv"):
+        return True
+    return False
 
 
 def main():
@@ -995,7 +1428,8 @@ def main():
     share_year = None
     tmdb_id = None
     if page_meta and page_meta.get("title"):
-        raw_name, share_year, tmdb_id = parse_share_title(page_meta["title"])
+        raw_name, share_year, tmdb_id = parse_share_title(page_meta["title"],
+                                                           is_share_title=True)
         if raw_name:
             print(f"  片名: {raw_name} {('(' + share_year + ')') if share_year else ''}"
                   f"{('  [tmdb-' + tmdb_id + ']') if tmdb_id else ''}")
@@ -1004,9 +1438,13 @@ def main():
 
     # 3.5 合集分支：分享目录里递归列出多部不同影片 → 直接出合集帖
     if not args.title:
-        items = collect_media_items(page_meta.get("deep_files") if page_meta else None)
+        items = collect_media_items(page_meta.get("deep_files") if page_meta else None,
+                                    page_meta.get("dir_nodes") if page_meta else None)
         if len(items) >= 2:
             print(f"\n🧩 检测到合集（{len(items)} 部）")
+            if any(not it.get("tmdb") for it in items):
+                print("  ⏳ 正在补全 TMDB 信息…")
+                enrich_items_with_tmdb(items)
             for it in items[:6]:
                 print(f"   - {it['title']} {('(' + str(it['year']) + ')') if it.get('year') else ''}"
                       f"{(' [tmdb-' + it['tmdb'] + ']') if it.get('tmdb') else ''}"
@@ -1029,10 +1467,15 @@ def main():
             txt_path = out_dir / f"{safe}_share.txt"
             txt_path.write_text(collection_text, encoding="utf-8")
             print(f"📄 文本已保存:{txt_path}")
+            cover = None
+            if want_pic:
+                cover, cover_src = pick_collection_cover(
+                    items, raw_name or "影视合集")
+                print(f"🖼  合集封面来源:{cover_src}")
             if mode == "long":
                 try:
                     maker = PosterMaker(width=args.image_width, font_size=args.font_size)
-                    img = maker.render(collection_text, None,
+                    img = maker.render(collection_text, poster_img=cover,
                                        title=(raw_name or "影视合集"))
                     img_path = out_dir / f"{safe}_share.jpg"
                     img.save(img_path, quality=92)
@@ -1040,9 +1483,8 @@ def main():
                 except Exception as e:
                     sys.stderr.write(f"[生成图片失败] {e}\n")
             elif mode == "poster":
-                cover = _try_collection_cover(items, raw_name or "影视合集", len(items))
                 if cover is None:
-                    sys.stderr.write("⚠ 子文件无 TMDB 标记，无法生成合集封面，仅输出文本\n")
+                    sys.stderr.write("⚠ 合集封面生成失败，仅输出文本\n")
                 else:
                     data = poster_to_jpeg(cover)
                     cov_path = out_dir / f"{safe}_cover.jpg"
@@ -1208,8 +1650,9 @@ def main():
 
 NON_MEDIA_EXTS = {".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".lrc",
                   ".txt", ".nfo", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}
+# .bdmv/.mpls/.clpi 是蓝光原盘的索引文件，不是影片本体
 MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv",
-              ".flv", ".rmvb", ".m4v", ".webm", ".iso", ".bdmv"}
+              ".flv", ".rmvb", ".m4v", ".webm", ".iso"}
 
 
 def parse_quality_from_name(name):
@@ -1241,41 +1684,343 @@ def parse_quality_from_name(name):
     return " ".join(tags) if tags else ""
 
 
-def collect_media_items(deep_files):
+def _identity_score(c):
+    """给一组 (片名, 年份, tmdb) 打分：带 TMDB ID / 年份 / 中文片名的更可信"""
+    t, y, tm = c
+    s = 0
+    if tm:
+        s += 4
+    if y:
+        s += 2
+    if t:
+        if re.search(r"[\u4e00-\u9fff]", t):
+            s += 2
+        if len(t) <= 40:
+            s += 1
+        # 纯英文原名（Fast.and.Furious）仍可用，只是优先级低
+    return s
+
+
+def _pick_identity(self_info, dir_info):
+    """融合「文件名解析结果」和「父目录名解析结果」：
+    片名优先取中文（目录名通常是中文片名，文件名常是英文原名），
+    年份 / TMDB ID 取两边任意非空值。
+    """
+    a = tuple(self_info) if self_info else ("", None, None)
+    b = tuple(dir_info) if dir_info else ("", None, None)
+    if not a[0] and not b[0]:
+        return "", None, None
+    if not a[0]:
+        return b
+    if not b[0]:
+        return a
+
+    def cjk(x):
+        return bool(re.search(r"[\u4e00-\u9fff]", x or ""))
+
+    if cjk(b[0]) and not cjk(a[0]):
+        title = b[0]
+    elif cjk(a[0]) and not cjk(b[0]):
+        title = a[0]
+    else:
+        title = (a if _identity_score(a) >= _identity_score(b) else b)[0]
+    return title, (a[1] or b[1]), (a[2] or b[2])
+
+
+def collect_media_items(deep_files, dir_nodes=None):
     """把递归列出的文件整理成影视条目（去重：同片不同后缀/分卷只算一个）。
     返回 [{file, name, title, year, tmdb, quality, ext, size}]，已按年份排序。
     过滤掉字幕 / 封面 / 文本等附属文件。
+
+    文件大小字段兼容 fileSize / size；片名优先取「父目录名」里的中文片名与
+    {tmdb-id}（很多合集是 每部片一个文件夹，里面才是英文原名的 mkv）。
     """
     raw = []
     for f in deep_files or []:
         name = (f.get("fileName") or "").strip()
-        ext = Path(name).suffix.lower()
+        ext = (f.get("ext") or Path(name).suffix or "").lower()
         if ext not in MEDIA_EXTS:
             continue
         base = Path(name).stem
         # 同片分卷：名字主体去掉 part/cd/disc/分卷 数字后再归并
         key = re.sub(r"[-_ .]?(part|cd|disc|pt|vol|分卷|上下)?[-_ .]?\d{1,2}$", "", base, flags=re.I)
-        t, year, tmdb = parse_share_title(base)
+        title, year, tmdb = _pick_identity(
+            parse_share_title(base),
+            (f.get("_dir_title"), f.get("_dir_year"), f.get("_dir_tmdb")),
+        )
+        # 画质：文件名优先，没有再看父目录名（如 “- 4K REMUX”）
+        qual = parse_quality_from_name(name)
+        if not qual and f.get("_dir_title"):
+            qual = parse_quality_from_name(str(f.get("_dir_title")))
         raw.append({
-            "file": name, "ext": ext, "size": f.get("size") or 0,
-            "quality": parse_quality_from_name(name),
-            "key": key.lower(), "title": t or base,
+            "file": name, "ext": ext,
+            "size": f.get("fileSize") or f.get("size") or 0,
+            "thumb": f.get("thumbnail") or "",
+            "quality": qual,
+            "key": (key or base).lower(), "title": title or base,
             "year": int(year) if (year or "").isdigit() else None,
             "tmdb": tmdb,
         })
-    # 去重：同一 (key, year)
+
+    # 目录兜底：接口只返回到目录层（或文件全是非标准后缀）时，
+    # 用「看起来像一部片」的目录名直接当条目
+    if not raw and dir_nodes:
+        for d in dir_nodes:
+            name = (d.get("fileName") or "").strip()
+            if is_junk_title(name):
+                continue
+            t, y, tm = parse_share_title(name)
+            if not t:
+                continue
+            looks_media = bool(tm or y or parse_quality_from_name(name))
+            if not looks_media:
+                continue
+            raw.append({
+                "file": name, "ext": "", "size": 0, "thumb": "",
+                "quality": parse_quality_from_name(name),
+                "key": t.lower(), "title": t,
+                "year": int(y) if (y or "").isdigit() else None,
+                "tmdb": tm,
+            })
+
+    # 去重：同一 (key, year)；同片多版本按 (标题, 年份) 再并一次
     seen, items = {}, []
     for it in raw:
+        if is_junk_title(it.get("title")):
+            continue                    # 蓝光原盘结构名 / 纯数字，不是影片
         uid = (it["key"], it["year"])
         if uid in seen:
             old = seen[uid]
-            old["ext"] = old["ext"] + "+" + it["ext"]
+            old["ext"] = old["ext"] + "+" + it["ext"] if it["ext"] else old["ext"]
+            old["size"] = max(old["size"] or 0, it["size"] or 0)
+            old["thumb"] = old["thumb"] or it["thumb"]
             if not old["quality"]:
                 old["quality"] = it["quality"]
+            if not old["tmdb"]:
+                old["tmdb"] = it["tmdb"]
             continue
         seen[uid] = it
         items.append(it)
-    items.sort(key=lambda x: (x["year"] or 9999, x["title"]))
+    # 同片不同版本（目录名重复）再归一：按 (标题, 年份)
+    merged, mseen = [], {}
+    for it in items:
+        uid = ((it["title"] or "").strip().lower(), it["year"])
+        if uid in mseen:
+            old = mseen[uid]
+            old["size"] = max(old["size"] or 0, it["size"] or 0)
+            if not old["tmdb"]:
+                old["tmdb"] = it["tmdb"]
+            continue
+        mseen[uid] = it
+        merged.append(it)
+    # 只拿到「一部片一个文件夹」但没扫到视频文件时，用目录名补齐片单
+    # （要求该目录子树里确实有视频文件，避免把只有截图的空壳目录算成一部）
+    parents_with_media = set()
+    for f in deep_files or []:
+        nm = (f.get("fileName") or "")
+        if (f.get("ext") or Path(nm).suffix or "").lower() in MEDIA_EXTS:
+            if f.get("parentId"):
+                parents_with_media.add(f["parentId"])
+            for pid in (f.get("fullParentIds") or "").split("/"):
+                if pid:
+                    parents_with_media.add(pid)
+    strict = bool(raw)          # 一个视频都没扫到时放宽，纯靠目录名兜底
+
+    # ===== 中文文件夹 → 视频 反哺匹配 =====
+    # 常见坑：上传者把多部片错误塞进同一个「片名(年份){tmdb}」文件夹，
+    # 导致所有视频都继承到同一个错误的父目录身份；真正带正确 tmdb 的中文文件夹
+    # 反而是平级的空壳目录（只放截图/字幕）。这里用「tmdb-id / 年份+序号 / 年份唯一」
+    # 把中文文件夹的权威身份反哺给视频条目，保证片单中文名 + tmdb 都正确。
+    cn_folders = []
+    for d in dir_nodes or []:
+        name = (d.get("fileName") or "").strip()
+        if is_junk_title(name):        # 蓝光原盘结构名（BDMV/STREAM/AUXDATA…）
+            continue
+        if not looks_like_single_title(name):
+            continue
+        t, y, tm = parse_share_title(name)
+        if not t:
+            continue
+        year = int(y) if (y or "").isdigit() else None
+        cn_folders.append({
+            "title": t, "year": year, "tmdb": tm,
+            "part": extract_part(name),
+            "quality": parse_quality_from_name(name),
+            "fileId": d.get("fileId"),
+        })
+
+    for cf in cn_folders:
+        best, best_score = None, 0
+        for it in merged:
+            if it.get("_cn_matched"):
+                continue
+            score = 0
+            it_part = extract_part(it["title"])
+            if cf["tmdb"] and it.get("tmdb") == cf["tmdb"]:
+                score = 100
+            elif cf["year"] and it.get("year") == cf["year"] and cf["part"] and it_part == cf["part"]:
+                score = 80          # 同年 + 同序号（如 Reloaded/Revolutions 同为 2003）
+            elif cf["year"] and it.get("year") == cf["year"] and cf["part"] is None and it_part is None:
+                score = 70          # 同年且都无序号（如 1999 唯一一部）
+            elif cf["part"] and it_part == cf["part"] and (cf["year"] is None or it.get("year") == cf["year"]):
+                score = 60          # 仅序号匹配（中文文件夹缺年份时）
+            if score >= 60:
+                if score > best_score:
+                    best_score, best = score, it
+        if best is not None:
+            best["_cn_matched"] = True
+            if cf["tmdb"] and not best["tmdb"]:
+                best["tmdb"] = cf["tmdb"]
+            if re.search(r"[\u4e00-\u9fff]", cf["title"]) and \
+                    not re.search(r"[\u4e00-\u9fff]", best["title"] or ""):
+                best["title"] = cf["title"]
+            if not best["quality"]:
+                best["quality"] = cf["quality"]
+
+    # 真正缺视频的目录才作为新条目补进片单（避免把已匹配的中文文件夹重复计入）
+    def _base_series(t):
+        return re.sub(r"\d+$", "", norm_title(t) or "")   # 去尾部序号，比系列名
+    for cf in cn_folders:
+        if any((i.get("tmdb") == cf["tmdb"] and cf["tmdb"])
+               or (i["year"] == cf["year"] and extract_part(i["title"]) == cf["part"]
+                   and cf["year"] is not None)
+               or norm_title(i["title"]) == norm_title(cf["title"])
+               or _base_series(i["title"]) == _base_series(cf["title"])
+               for i in merged):
+            continue
+        # 该目录子树里确有视频时才补（strict 模式且有身份标识者放宽）
+        has_identity = bool(cf["tmdb"] or cf["year"])
+        if strict and not has_identity and cf["fileId"] not in parents_with_media:
+            continue
+        merged.append({
+            "file": cf["title"], "ext": "", "size": 0, "thumb": "",
+            "quality": cf["quality"],
+            "key": cf["title"].lower(), "title": cf["title"],
+            "year": cf["year"], "tmdb": cf["tmdb"],
+        })
+
+    # 同片跨语言/多版本再归一。谨慎合并，避免把同年的两部不同片子并成一部：
+    #   · 语言不同（中文名 vs 英文原名）→ 视为同一部，合并
+    #   · 标题归一化后相同或互为子串 → 合并
+    #   · 其余同年条目 → 保留（如 The.Matrix.Reloaded / Revolutions 都是 2003）
+    def _cjk(x):
+        return bool(re.search(r"[\u4e00-\u9fff]", x or ""))
+
+    final, by_year = [], {}
+    for it in merged:
+        y = it["year"]
+        old = by_year.get(y) if y else None
+        if old is not None:
+            can_merge = (_cjk(old["title"]) != _cjk(it["title"])
+                         or norm_title(old["title"]) == norm_title(it["title"])
+                         or norm_title(old["title"]) in norm_title(it["title"])
+                         or norm_title(it["title"]) in norm_title(old["title"]))
+            if not can_merge:
+                final.append(it)
+                continue
+            old["size"] = max(old["size"] or 0, it["size"] or 0)
+            if not old["tmdb"]:
+                old["tmdb"] = it["tmdb"]
+            if not old["quality"]:
+                old["quality"] = it["quality"]
+            # 中文片名优先
+            if not _cjk(old["title"]) and _cjk(it["title"]):
+                old["title"] = it["title"]
+            continue
+        if y:
+            by_year[y] = it
+        final.append(it)
+    final.sort(key=lambda x: (x["year"] or 9999, x["title"]))
+    return final
+
+
+def enrich_items_with_tmdb(items, max_items=40, workers=4, verbose=False):
+    """给没有 tmdb-id 的条目按「片名 + 年份」搜 TMDB 补 id 与中文名。
+
+    演员个人作品合集（如「詹妮弗·康纳利 42 部」）的分享里通常不带 {tmdb-id}，
+    会导致封面只能掉到「剧照拼图」兜底、片单也拿不到中文名。这里统一补全。
+    命中后：
+      · 填 tmdb id（供封面直取官方海报）
+      · 片名是英文原名 → 换回 TMDB 的中文名
+      · 年份缺失 → 用 TMDB 年份补
+    只在「标题疑似外文」或「缺 tmdb」时才查，避免对已完整的合集浪费请求。
+    """
+    if not items:
+        return items
+    web = TMDBWebClient()
+    todo = [it for it in items if not it.get("tmdb")
+            and not is_junk_title(it.get("title"))][:max_items]
+    if not todo:
+        return items
+
+    def _lookup(it):
+        title = it.get("title") or ""
+        if not title:
+            return None
+        # 候选关键词：标题本身 → 去尾部序号 → 父目录里的英文原名（如有）
+        names = [title, re.sub(r"[\s\-_]*\d+\s*$", "", title).strip()]
+        alt = it.get("file") or ""
+        # 从原始文件名里提取英文核心名（The.Hot.Spot.1990... → The Hot Spot）
+        m = re.search(r"^([A-Za-z][A-Za-z0-9'&\s]{2,60}?)[\s.]"
+                      r"(?:19|20)\d{2}", alt)
+        if m:
+            names.append(m.group(1).replace(".", " ").strip())
+        cands = []
+        for n in dict.fromkeys([x for x in names if x]):
+            try:
+                cands = web.search_by_name(n) or []
+            except Exception:      # noqa: BLE001
+                cands = []
+            if cands:
+                break
+        if not cands:
+            return None
+        # 优先挑年份一致的候选（逐个查详情页核对年份）
+        yr = it.get("year")
+        if yr:
+            for c in cands[:4]:
+                got = web.detail_by_id(c["id"])
+                if got and str((got.get("info") or {}).get("year") or "")[:4] == str(yr):
+                    info = got.get("info") or {}
+                    return {
+                        "tmdb": str(c["id"]),
+                        "title": info.get("title") or title,
+                        "year": int(yr),
+                    }
+        # 没有年份线索 / 年份都对不上 → 取第一条（搜索相关性最高）
+        got = web.detail_by_id(cands[0]["id"])
+        if not got:
+            return None
+        info = got.get("info") or {}
+        return {
+            "tmdb": str(cands[0]["id"]),
+            "title": info.get("title") or title,
+            "year": it.get("year") or (
+                int(str(info.get("year"))) if str(info.get("year", "")).isdigit() else None),
+        }
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            hits = list(ex.map(_lookup, todo))
+    except Exception:              # noqa: BLE001
+        hits = []
+    filled = 0
+    for it, hit in zip(todo, hits):
+        if not hit:
+            continue
+        if hit.get("tmdb") and not it.get("tmdb"):
+            it["tmdb"] = hit["tmdb"]
+        # 英文原名 → 换中文名（保持信息更规范）
+        ht = hit.get("title") or ""
+        if ht and re.search(r"[\u4e00-\u9fff]", ht) and \
+                not re.search(r"[\u4e00-\u9fff]", it.get("title") or ""):
+            it["title"] = ht
+        if not it.get("year") and hit.get("year"):
+            it["year"] = hit["year"]
+        filled += 1
+    if verbose:
+        sys.stderr.write(f"[TMDB 补全] {filled}/{len(todo)} 条命中\n")
     return items
 
 
@@ -1325,7 +2070,7 @@ def build_collection_text(share, series_name, items, quality=None, size=None, sy
     shown = 0
     for it in items:
         shown += 1
-        if shown > 15:
+        if shown > 30:
             lines.append(f"    …其余 {len(items) - shown + 1} 部见分享目录")
             break
         tag = it["quality"]
@@ -1401,15 +2146,22 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
     raw_name = title or ""
     share_year, tmdb_id = None, None
     if page_meta and page_meta.get("title"):
-        raw_name, share_year, tmdb_id = parse_share_title(page_meta["title"])
+        raw_name, share_year, tmdb_id = parse_share_title(page_meta["title"],
+                                                          is_share_title=True)
         if raw_name:
             log(f"  片名: {raw_name} {('(' + share_year + ')') if share_year else ''}"
                 f"{('  [tmdb-' + tmdb_id + ']') if tmdb_id else ''}")
 
     # ===== 合集分支：递归列出的文件里有多部不同影片 =====
-    items = collect_media_items(page_meta.get("deep_files") if page_meta else None)
+    items = collect_media_items(page_meta.get("deep_files") if page_meta else None,
+                                page_meta.get("dir_nodes") if page_meta else None)
     if len(items) >= 2 and not title:
         log(f"\n🧩 检测到合集（{len(items)} 部）")
+        # 演员/导演个人作品合集常不带 {tmdb-id}，统一按片名+年份补全，
+        # 让片单有中文名、封面能直取官方海报（而不是退化成剧照拼图）
+        if any(not it.get("tmdb") for it in items):
+            log("  ⏳ 正在补全 TMDB 信息…")
+            enrich_items_with_tmdb(items, verbose=verbose)
         for it in items[:8]:
             log(f"   - {it['title']} {('(' + str(it['year']) + ')') if it.get('year') else ''}"
                 f"{(' [tmdb-' + it['tmdb'] + ']') if it.get('tmdb') else ''}"
@@ -1429,24 +2181,26 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
         log(text)
         log("─" * 56 + "\n")
         import base64 as _b64
+        # 封面：四级兜底，保证合集一定有图可用
+        cover, cover_src = (None, "")
+        if want_pic:
+            cover, cover_src = pick_collection_cover(items, result["title"])
+            if cover is not None:
+                log(f"  🖼 合集封面来源: {cover_src}")
+                result["cover_b64"] = _b64.b64encode(
+                    poster_to_jpeg(cover)).decode()
         if mode == "long":
             try:
                 maker = PosterMaker(width=width, font_size=font_size)
-                img = maker.render(text, None, title=result["title"])
+                img = maker.render(text, poster_img=cover,
+                                   title=result["title"])
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
                 result["image_b64"] = _b64.b64encode(buf.getvalue()).decode()
-            except Exception as e:
+            except Exception as e:      # noqa: BLE001
                 log(f"  ⚠ 合集长图生成失败: {e}")
-        elif mode == "poster":
-            # 合成一张合集封面（首部海报 + 底部标注），转 JPEG < 500KB
-            cover = _try_collection_cover(items, result["title"], len(items))
-            if cover is None:
-                log("  ⚠ 子文件无 TMDB 标记，无法生成合集封面")
-            else:
-                jpg = poster_to_jpeg(cover)
-                if jpg:
-                    result["cover_b64"] = _b64.b64encode(jpg).decode()
+        elif mode == "poster" and cover is None:
+            log("  ⚠ 合集封面生成失败")
         result["ok"] = True
         return result
 
