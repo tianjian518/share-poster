@@ -45,7 +45,7 @@ except ImportError:
 
 
 # --- 常量 ---------------------------------------------------------------
-VERSION = "1.0.7"
+VERSION = "1.1.0"
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
@@ -1123,6 +1123,462 @@ def save_config(cfg):
         pass
 
 
+# --- 光鸭云盘账号（登录 / token / 文件操作）--------------------------------
+class GuangyaAccount:
+    """光鸭云盘账号客户端。
+
+    能力：
+      · 短信登录（init → send → verify → signin 四步，参考 guangyaclient）
+      · 手动贴 access_token / refresh_token
+      · token 自动持久化到 ~/.share_poster.json（含过期时间）
+      · 文件操作：列目录 / 重命名 / 取详情（用于给自己的分享内文件改名）
+
+    接口分两个域：
+      · account.guangyapan.com —— 登录鉴权
+      · api.guangyapan.com/nd.bizuserres.s/v1 —— 文件/分享操作
+    """
+
+    ACCOUNT_BASE = "https://account.guangyapan.com"
+    API_BASE = "https://api.guangyapan.com/nd.bizuserres.s/v1"
+    CLIENT_ID = "aMe-8VSlkrbQXpUR"
+
+    def __init__(self, access_token=None, refresh_token=None, device_id=None):
+        self.token = access_token or ""
+        self.refresh_token_value = refresh_token or ""
+        self.expires_at = None
+        self.device_id = device_id or self._gen_did()
+        self.session = requests.Session()
+        self.session.headers.update({
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "did": self.device_id,
+            "dt": "4",
+            "origin": "https://www.guangyapan.com",
+            "referer": "https://www.guangyapan.com/",
+            "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+        })
+
+    # ---- 基础设施 ----
+    @staticmethod
+    def _gen_did():
+        import hashlib as _h
+        import os as _os
+        return _h.md5(_os.urandom(16)).hexdigest()
+
+    @staticmethod
+    def _traceparent():
+        import secrets as _s
+        return f"00-{_s.token_hex(16)}-{_s.token_hex(8)}-01"
+
+    def _account_headers(self, with_token=False):
+        h = {
+            "accept": "*/*",
+            "content-type": "application/json",
+            "origin": "https://www.guangyapan.com",
+            "referer": "https://www.guangyapan.com/",
+            "x-client-id": self.CLIENT_ID,
+            "x-client-version": "0.0.1",
+            "x-device-id": self.device_id,
+            "x-device-model": "chrome%2F120.0.0.0",
+            "x-device-name": "PC-Chrome",
+            "x-device-sign": f"wdi10.{self.device_id}",
+            "x-net-work-type": "NONE",
+            "x-os-version": "Win32",
+            "x-platform-version": "1",
+            "x-protocol-version": "301",
+            "x-provider-name": "NONE",
+            "x-sdk-version": "9.0.2",
+            "user-agent": self.session.headers["user-agent"],
+        }
+        if with_token and self.token:
+            h["authorization"] = f"Bearer {self.token}"
+        return h
+
+    # ---- 登录：短信流程 ----
+    def login_sms_init(self, phone):
+        """第一步：初始化验证码（可能返回 captcha_token 或人机验证 url）"""
+        body = {
+            "client_id": self.CLIENT_ID,
+            "action": "POST:/v1/auth/verification",
+            "device_id": self.device_id,
+            "meta": {"phone_number": phone},
+        }
+        r = self.session.post(f"{self.ACCOUNT_BASE}/v1/shield/captcha/init",
+                              headers=self._account_headers(), json=body, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    def login_sms_send(self, phone, captcha_token):
+        """第二步：发送短信验证码"""
+        h = self._account_headers()
+        h["x-captcha-token"] = captcha_token
+        r = self.session.post(f"{self.ACCOUNT_BASE}/v1/auth/verification",
+                              headers=h,
+                              json={"phone_number": phone, "target": "ANY",
+                                    "client_id": self.CLIENT_ID}, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    def login_sms_verify(self, verification_id, code):
+        """第三步：校验验证码，拿 verification_token"""
+        r = self.session.post(
+            f"{self.ACCOUNT_BASE}/v1/auth/verification/verify",
+            headers=self._account_headers(),
+            json={"verification_id": verification_id,
+                  "verification_code": code,
+                  "client_id": self.CLIENT_ID}, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    def login_sms_signin(self, code, verification_token, phone, captcha_token):
+        """第四步：提交登录，拿 access_token / refresh_token"""
+        h = self._account_headers()
+        h["x-captcha-token"] = captcha_token
+        r = self.session.post(
+            f"{self.ACCOUNT_BASE}/v1/auth/signin",
+            headers=h,
+            json={"verification_code": code,
+                  "verification_token": verification_token,
+                  "username": phone,
+                  "client_id": self.CLIENT_ID}, timeout=20)
+        r.raise_for_status()
+        return self._apply_token(r.json())
+
+    def _apply_token(self, result):
+        """把登录/刷新返回的 token 落进实例"""
+        if not isinstance(result, dict):
+            return result
+        at = result.get("access_token")
+        if at:
+            self.token = at
+            self.session.headers["authorization"] = f"Bearer {at}"
+            exp = result.get("expires_in")
+            self.expires_at = time.time() + int(exp) if exp else None
+            rt = result.get("refresh_token")
+            if rt:
+                self.refresh_token_value = rt
+        return result
+
+    def login_sms(self, phone, get_code=None):
+        """短信登录全流程。get_code 为取验证码的回调（Web 场景由前端传）。"""
+        init = self.login_sms_init(phone)
+        captcha = init.get("captcha_token")
+        if not captcha:
+            raise RuntimeError(f"初始化验证码失败：{init}")
+        send = self.login_sms_send(phone, captcha)
+        vid = send.get("verification_id")
+        if not vid:
+            raise RuntimeError(f"发送验证码失败：{send}")
+        if get_code is None:
+            def get_code():
+                return input("请输入短信验证码: ")
+        code = get_code()
+        ver = self.login_sms_verify(vid, code)
+        vtok = ver.get("verification_token")
+        if not vtok:
+            raise RuntimeError(f"验证码校验失败：{ver}")
+        return self.login_sms_signin(code, vtok, phone, captcha)
+
+    def refresh_token(self):
+        """用 refresh_token 换新的 access_token"""
+        if not self.refresh_token_value:
+            raise RuntimeError("没有可用的 refresh_token，请重新登录")
+        h = self._account_headers()
+        h["x-action"] = "401"
+        r = self.session.post(
+            f"{self.ACCOUNT_BASE}/v1/auth/token", headers=h,
+            json={"client_id": self.CLIENT_ID, "grant_type": "refresh_token",
+                  "refresh_token": self.refresh_token_value}, timeout=20)
+        r.raise_for_status()
+        return self._apply_token(r.json())
+
+    def user_info(self):
+        """获取当前登录用户信息"""
+        r = self.session.post(
+            f"{self.ACCOUNT_BASE}/v1/user/me",
+            headers=self._account_headers(with_token=True), timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    # ---- 业务 API（自动带 token / 401 自动刷新）----
+    def _post_api(self, path, payload, _retried=False):
+        h = {"traceparent": self._traceparent(),
+             "authorization": f"Bearer {self.token}"}
+        r = self.session.post(f"{self.API_BASE}/{path}", json=payload,
+                              headers=h, timeout=30)
+        if r.status_code == 401 and self.refresh_token_value and not _retried:
+            self.refresh_token()
+            return self._post_api(path, payload, _retried=True)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and data.get("code") not in (0, None) \
+                and data.get("msg") not in ("success", None):
+            raise RuntimeError(f"接口异常：{str(data)[:200]}")
+        return data.get("data", data) if isinstance(data, dict) else data
+
+    def fs_rename(self, file_id, new_name):
+        """重命名文件/文件夹"""
+        return self._post_api("rename", {"fileId": str(file_id),
+                                         "newName": new_name})
+
+    def fs_list(self, parent_id="", page_size=100):
+        """列出某目录下的文件（parentId 为空 = 根目录）"""
+        return self._post_api("get_file_list", {
+            "pageSize": page_size, "orderBy": 0, "sortType": 0,
+            "parentId": "" if parent_id is None else str(parent_id)})
+
+    def fs_detail(self, file_id):
+        """获取文件详情"""
+        return self._post_api("get_file_detail", {"fileId": str(file_id)})
+
+    # ---- 持久化 ----
+    def save_to_config(self, extra=None):
+        cfg = load_config()
+        cfg["guangya"] = {
+            "access_token": self.token,
+            "refresh_token": self.refresh_token_value,
+            "device_id": self.device_id,
+            "expires_at": self.expires_at,
+        }
+        if extra:
+            cfg["guangya"].update(extra)
+        save_config(cfg)
+
+    @classmethod
+    def from_config(cls):
+        """从配置文件恢复登录态（没有则返回未登录实例）"""
+        g = (load_config().get("guangya") or {})
+        acc = cls(access_token=g.get("access_token"),
+                  refresh_token=g.get("refresh_token"),
+                  device_id=g.get("device_id"))
+        acc.expires_at = g.get("expires_at")
+        return acc
+
+    @property
+    def logged_in(self):
+        return bool(self.token)
+
+
+def guangya_login_interactive():
+    """命令行交互式登录（供 CLI 直接调用）"""
+    acc = GuangyaAccount()
+    print("── 光鸭云盘登录 ──")
+    phone = input("手机号（含区号，如 +86 13800138000）: ").strip()
+    if not phone:
+        raise RuntimeError("手机号不能为空")
+    try:
+        acc.login_sms(phone)
+    except Exception as e:      # noqa: BLE001
+        print(f"❌ 登录失败：{e}")
+        return None
+    try:
+        info = acc.user_info()
+        data = info.get("data") or info
+        name = data.get("nickname") or data.get("name") or ""
+    except Exception:           # noqa: BLE001
+        name = ""
+    acc.save_to_config()
+    print(f"✅ 登录成功{('：' + name) if name else ''}（token 已保存）")
+    return acc
+
+
+# --- 分享内文件重命名 ------------------------------------------------------
+def rename_plan_lines(plan, limit=None, status_of=None):
+    """把重命名计划渲染成可读文本行（CLI / Web 共用）。"""
+    out = []
+    rows = plan if limit is None else plan[:limit]
+    for i, p in enumerate(rows, 1):
+        st = (status_of or {}).get(p.get("fileId"), "")
+        mark = {"ok": "✔", "failed": "✘"}.get(st, "·")
+        kind = "📁" if p.get("is_dir") else "🎞"
+        out.append(f"  {mark} {i:>3}. {kind} {p['old']}\n"
+                   f"          → {p['new']}")
+    if limit is not None and len(plan) > limit:
+        out.append(f"  … 其余 {len(plan) - limit} 项略")
+    return "\n".join(out)
+
+
+def guangya_token_days_left(acc):
+    """token 距离过期还剩多少天，未知返回 None"""
+    try:
+        exp = getattr(acc, "expires_at", None)
+        if not exp:
+            return None
+        if isinstance(exp, str):
+            exp = float(exp)
+        if exp > 1e11:                     # 毫秒
+            exp = exp / 1000.0
+        return (exp - time.time()) / 86400.0
+    except Exception:                       # noqa: BLE001
+        return None
+
+
+def ensure_guangya_account(verbose=True, auto_refresh=True):
+    """取已登录的光鸭账号；token 将过期时自动续期。未登录返回 None。"""
+    acc = GuangyaAccount.from_config()
+    if not acc.logged_in:
+        if verbose:
+            print("⚠ 未登录光鸭云盘。先执行：python3 share_poster.py --login-guangya")
+        return None
+    days = guangya_token_days_left(acc)
+    if auto_refresh and acc.refresh_token_value and days is not None and days < 3:
+        try:
+            acc.refresh_token()
+            acc.save_to_config()
+            if verbose:
+                print("🔄 登录态已自动续期")
+        except Exception as e:              # noqa: BLE001
+            if verbose:
+                print(f"⚠ 自动续期失败（{e}），仍尝试使用旧 token")
+    return acc
+
+
+def build_rename_plan(deep_files, dir_nodes, items=None, name_fmt=None):
+    """为一次分享生成「原名 → 规范名」重命名计划（纯计算，不落盘）。
+
+    目标格式（Emby 友好，他人转存后可直接刮削）：
+      文件夹: 片名 (年份) [画质] {tmdb-id}
+      文件:   片名 (年份) [画质] {tmdb-id}.mkv
+
+    参数：
+      deep_files / dir_nodes —— CloudShareFetcher.fetch() 的产物
+      items                  —— collect_media_items() 结果（提供中文名/年份/tmdb）
+      name_fmt(fmt_kwargs)->str —— 自定义命名函数，不传则用默认格式
+
+    返回 [{"fileId","is_dir","old","new","changed","reason"}, ...]
+    """
+    if items is None:
+        items = collect_media_items(deep_files, dir_nodes)
+
+    def _norm_key(x):
+        return norm_title((x or "").split("(")[0])
+
+    # 支持两种 items：
+    #   · collect_media_items() 的新格式 —— 自带 fileId/fileIds，精确到文件
+    #   · 旧格式 / 测试数据 —— 只带标题，退化为按目录名匹配
+    item_by_key, item_by_fid = {}, {}
+    for it in items or []:
+        k = _norm_key(it.get("title"))
+        if k and k not in item_by_key:
+            item_by_key[k] = it
+        for fid in ([it.get("fileId")] + list(it.get("fileIds") or [])):
+            if fid:
+                item_by_fid[str(fid)] = it
+
+    def _fmt(**kw):
+        if name_fmt:
+            return name_fmt(**kw)
+        title = kw["title"] or ""
+        year = kw.get("year")
+        quality = kw.get("quality") or ""
+        tmdb = kw.get("tmdb")
+        ext = kw.get("ext") or ""
+        s = title
+        if year:
+            s += f" ({year})"
+        if quality:
+            s += f" [{quality}]"
+        if tmdb:
+            s += f" {{tmdb-{tmdb}}}"
+        return s + ext
+
+    plan = []
+
+    def _push(file_id, is_dir, old, new, reason=""):
+        new = (new or "").strip()
+        if not file_id or not old or not new:
+            return
+        if new == old:
+            return
+        plan.append({"fileId": str(file_id), "is_dir": is_dir,
+                     "old": old, "new": new, "changed": True,
+                     "reason": reason})
+
+    # ---- 文件夹 ----
+    root_fid = str(dir_nodes[0].get("fileId")) if dir_nodes else ""
+    for d in (dir_nodes or []):
+        old = (d.get("fileName") or "").strip()
+        if not old or is_junk_title(old):
+            continue
+        # 分享根目录（名字通常就是分享标题，如「速度与激情 合集」）不动，
+        # 否则会把「XX 合集」也改成单片格式。
+        if str(d.get("fileId")) == root_fid or is_collection_title(old):
+            continue
+        if not looks_like_single_title(old):
+            continue
+        t, y, tm = parse_share_title(old)
+        if not t:
+            continue
+        it = item_by_fid.get(str(d.get("fileId"))) or item_by_key.get(_norm_key(t))
+        title = (it or {}).get("title") or t
+        year = (it or {}).get("year") or (int(y) if (y or "").isdigit() else None)
+        tmdb = (it or {}).get("tmdb") or tm
+        quality = (it or {}).get("quality") or parse_quality_from_name(old)
+        new = _fmt(title=title, year=year, quality=quality, tmdb=tmdb,
+                   ext="", is_dir=True)
+        _push(d.get("fileId"), True, old, new, "文件夹规范化")
+
+    # ---- 文件 ----
+    for f in (deep_files or []):
+        old = (f.get("fileName") or "").strip()
+        ext = (f.get("ext") or Path(old).suffix or "").lower()
+        if ext not in MEDIA_EXTS:
+            continue
+        if is_junk_title(Path(old).stem):
+            continue
+        stem = Path(old).stem
+        # 身份优先级：文件自身 fileId 命中 > 父目录解析出的身份 > 文件名自身解析
+        it = item_by_fid.get(str(f.get("fileId")))
+        pt, py = f.get("_dir_title"), f.get("_dir_year")
+        if it is None and pt:
+            it = item_by_key.get(_norm_key(pt))
+        if it is not None:
+            title, year, tmdb = it.get("title") or pt, it.get("year"), it.get("tmdb")
+            if not year and py and str(py).isdigit():
+                year = int(py)
+        else:
+            title, year, tmdb = parse_share_title(stem)
+            year = int(year) if (year or "").isdigit() else None
+        if not title:
+            continue
+        quality = parse_quality_from_name(old) or parse_quality_from_name(pt or "")
+        new = _fmt(title=title, year=year, quality=quality, tmdb=tmdb,
+                   ext=ext, is_dir=False)
+        _push(f.get("fileId"), False, old, new, "文件名规范化")
+    return plan
+
+
+def apply_rename_plan(account, plan, dry_run=True, progress=None):
+    """执行重命名计划。dry_run=True 只返回结果不实际改。
+
+    返回 {"total","changed","skipped","failed","items":[...]}
+    """
+    out = {"total": len(plan or []), "changed": 0, "skipped": 0,
+           "failed": 0, "items": []}
+    for i, p in enumerate(plan or [], 1):
+        rec = dict(p)
+        if dry_run:
+            rec["status"] = "preview"
+            out["items"].append(rec)
+            out["changed"] += 1
+            continue
+        try:
+            account.fs_rename(p["fileId"], p["new"])
+            rec["status"] = "ok"
+            out["changed"] += 1
+        except Exception as e:      # noqa: BLE001
+            rec["status"] = "failed"
+            rec["error"] = str(e)[:160]
+            out["failed"] += 1
+        out["items"].append(rec)
+        if progress:
+            progress(i, len(plan), rec)
+        time.sleep(0.25)            # 轻微限流，避免触发风控
+    return out
+
+
 # --- 主流程 -------------------------------------------------------------
 def pick_one(results, media_label):
     if not results:
@@ -1349,6 +1805,95 @@ def is_junk_title(name):
     return False
 
 
+def _cli_rename(args, page_meta, items, do_rename):
+    """CLI：预览 / 执行重命名。返回 (plan, result)"""
+    account = None
+    need_account = do_rename
+    if need_account:
+        account = ensure_guangya_account()
+        if account is None:
+            return []
+    plan = build_rename_plan(page_meta.get("deep_files") if page_meta else None,
+                             page_meta.get("dir_nodes") if page_meta else None,
+                             items=items)
+    if args.rename_limit:
+        plan = plan[:args.rename_limit]
+    if not plan:
+        print("\n✏️  没有需要重命名的项目（名称已规范）")
+        return []
+    total = len(plan)
+    dirs = sum(1 for x in plan if x.get("is_dir"))
+    print(f"\n✏️  重命名预览：共 {total} 项（📁 文件夹 {dirs} · 🎞 文件 {total - dirs}）")
+    print(rename_plan_lines(plan, limit=None if total <= 40 else 25))
+    if not do_rename:
+        if not args.rename_dry_run:
+            print("\n（未执行；加 --rename 实际修改）")
+        return plan
+    print(f"\n⏳ 开始重命名 {total} 项…")
+    def _prog(i, n, rec):
+        print(f"  [{i}/{n}] {'✔' if rec.get('status') == 'ok' else '✘'} "
+              f"{rec['old']} → {rec['new']}"
+              f"{'' if rec.get('status') == 'ok' else '  (' + rec.get('error', '') + ')'}")
+    res = apply_rename_plan(account, plan, dry_run=False, progress=_prog)
+    print(f"\n✏️  完成：成功 {res['changed']} · 失败 {res['failed']}")
+    return plan
+
+
+def _cli_guangya_account(args):
+    """CLI：登录 / 贴 token / 查看状态 / 退出"""
+    # 退出登录
+    if args.logout_guangya:
+        cfg = load_config()
+        cfg.pop("guangya", None)
+        save_config(cfg)
+        print("✅ 已退出光鸭云盘登录（本地 token 已清除）")
+        return
+
+    # 贴 token 登录
+    if args.login_token or (args.refresh_token and not args.login_guangya):
+        acc = GuangyaAccount(access_token=args.login_token,
+                             refresh_token=args.refresh_token)
+        if not acc.token and acc.refresh_token_value:
+            print("⏳ 用 refresh_token 换取 access_token…")
+            try:
+                acc.refresh_token()
+            except Exception as e:              # noqa: BLE001
+                print(f"❌ 换取失败：{e}")
+                return
+        name = ""
+        try:
+            info = acc.user_info()
+            d = info.get("data") or info
+            name = d.get("nickname") or d.get("name") or d.get("phone") or ""
+        except Exception as e:                  # noqa: BLE001
+            print(f"⚠ 校验用户信息失败（token 可能无效）：{e}")
+        acc.save_to_config()
+        print(f"✅ 登录态已保存{('：' + str(name)) if name else ''}")
+        return
+
+    # 短信登录
+    if args.login_guangya:
+        guangya_login_interactive()
+        return
+
+    # 查看状态
+    acc = GuangyaAccount.from_config()
+    if not acc.logged_in:
+        print("❌ 未登录。执行：python3 share_poster.py --login-guangya")
+        return
+    name, days = "", guangya_token_days_left(acc)
+    try:
+        info = acc.user_info()
+        d = info.get("data") or info
+        name = d.get("nickname") or d.get("name") or d.get("phone") or ""
+    except Exception as e:                      # noqa: BLE001
+        print(f"⚠ 登录态可能已失效：{e}")
+    print(f"✅ 已登录{('：' + str(name)) if name else ''}")
+    if days is not None:
+        print(f"   token 剩余约 {days:.1f} 天"
+              f"{'（快过期了，执行时会自动续期）' if days < 3 else ''}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="影帖 v%s —— 给网盘分享链接，自动识别片名并产出发帖内容（支持 TMDB ID 自动抓取）" % VERSION
@@ -1378,6 +1923,26 @@ def main():
     parser.add_argument("--no-net", action="store_true",
                         help="禁用分享页/TMDB 网页抓取（只用手动/Key 数据）")
     parser.add_argument("--save-config", action="store_true", help="保存当前 key 到 ~/.share_poster.json")
+
+    # ---- 光鸭云盘账号 & 重命名 ----
+    parser.add_argument("--login-guangya", action="store_true",
+                        help="登录光鸭云盘（短信验证码，登录态存 ~/.share_poster.json）")
+    parser.add_argument("--login-token", metavar="ACCESS_TOKEN",
+                        help="直接贴 access_token 完成登录（配 --refresh-token 可自动续期）")
+    parser.add_argument("--refresh-token", metavar="REFRESH_TOKEN",
+                        help="配合 --login-token 使用；只给它则用刷新令牌换新 token")
+    parser.add_argument("--guangya-status", action="store_true",
+                        help="查看光鸭云盘登录状态")
+    parser.add_argument("--logout-guangya", action="store_true",
+                        help="退出光鸭云盘登录（清除本地 token）")
+    parser.add_argument("--rename", action="store_true",
+                        help="按规范格式重命名分享内的文件夹与视频（需先登录光鸭云盘）")
+    parser.add_argument("--rename-dry-run", action="store_true",
+                        help="只预览重命名结果，不实际修改")
+    parser.add_argument("--rename-limit", type=int, default=None,
+                        help="只处理前 N 项（分批执行，便于逐步确认）")
+    parser.add_argument("--show-rename-plan", action="store_true",
+                        help="生成帖子前，先打印重命名预览")
     args = parser.parse_args()
 
     # 出图模式：显式 --image-mode 优先；--no-image 兼容为 none
@@ -1386,6 +1951,12 @@ def main():
 
     cfg = load_config()
     api_key = args.key or cfg.get("tmdb_api_key") or os.environ.get("TMDB_API_KEY", "")
+
+    # 0. 光鸭云盘账号（登录 / 贴 token / 看状态 / 退出）
+    if args.login_guangya or args.login_token or args.refresh_token or \
+            args.guangya_status or args.logout_guangya:
+        _cli_guangya_account(args)
+        return
 
     # 1. 读分享文本
     if not args.share_text:
@@ -1445,6 +2016,10 @@ def main():
             if any(not it.get("tmdb") for it in items):
                 print("  ⏳ 正在补全 TMDB 信息…")
                 enrich_items_with_tmdb(items)
+
+            # ---- 发帖前重命名（需登录光鸭云盘）----
+            if args.rename or args.rename_dry_run or args.show_rename_plan:
+                _cli_rename(args, page_meta, items, do_rename=args.rename)
             for it in items[:6]:
                 print(f"   - {it['title']} {('(' + str(it['year']) + ')') if it.get('year') else ''}"
                       f"{(' [tmdb-' + it['tmdb'] + ']') if it.get('tmdb') else ''}"
@@ -1760,6 +2335,8 @@ def collect_media_items(deep_files, dir_nodes=None):
             "key": (key or base).lower(), "title": title or base,
             "year": int(year) if (year or "").isdigit() else None,
             "tmdb": tmdb,
+            "fileId": f.get("fileId"),
+            "fileIds": [f.get("fileId")] if f.get("fileId") else [],
         })
 
     # 目录兜底：接口只返回到目录层（或文件全是非标准后缀）时，
@@ -1798,6 +2375,9 @@ def collect_media_items(deep_files, dir_nodes=None):
                 old["quality"] = it["quality"]
             if not old["tmdb"]:
                 old["tmdb"] = it["tmdb"]
+            for _fid in (it.get("fileIds") or []):
+                if _fid and _fid not in old.setdefault("fileIds", []):
+                    old["fileIds"].append(_fid)
             continue
         seen[uid] = it
         items.append(it)
@@ -2097,7 +2677,8 @@ def build_collection_text(share, series_name, items, quality=None, size=None, sy
 # --- 一键生成（供 CLI / Web 复用） --------------------------------------
 def generate(share_text, quality=None, size=None, title=None, pick=1,
              include_image=True, width=720, font_size=28,
-             cloud=None, verbose=True, image_mode=None):
+             cloud=None, verbose=True, image_mode=None,
+             rename=False, account=None, page_meta=None):
     """输入分享文本，走完整自动链路，返回：
     {ok, text, title, image_b64 (长图PNG) | cover_b64(合集封面JPG),
      poster_jpg_b64 / poster_png_b64 (仅 image_mode='poster'),
@@ -2108,7 +2689,7 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
     mode = image_mode or ("long" if include_image else "none")
     result = {"ok": False, "text": "", "title": "", "image_b64": "",
               "cover_b64": "", "poster_jpg_b64": "", "poster_png_b64": "",
-              "cloud": "", "manual": False, "error": ""}
+              "cloud": "", "manual": False, "error": "", "rename": None}
     want_pic = mode in ("long", "poster")
 
     def log(*a):
@@ -2126,8 +2707,7 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
         log(f"  提取码:{share['code']}")
 
     # 分享页自动识别
-    page_meta = None
-    if not title:
+    if not title and page_meta is None:
         page_meta = CloudShareFetcher().fetch(share_text)
         if page_meta and page_meta.get("title"):
             log(f"\n🔎 分享页自动识别")
@@ -2168,6 +2748,29 @@ def generate(share_text, quality=None, size=None, title=None, pick=1,
                 f"{(' [' + it['quality'] + ']') if it.get('quality') else ''}")
         if len(items) > 8:
             log(f"   … 其余 {len(items) - 8} 部")
+        # 发帖前重命名实际文件（rename=True 且已登录时）
+        if rename:
+            _acc = account or ensure_guangya_account(verbose=verbose)
+            if _acc is None:
+                result["rename"] = {"ok": False,
+                                    "error": "未登录光鸭云盘，已跳过重命名"}
+                log("  ⚠ 未登录光鸭云盘，跳过重命名")
+            else:
+                _plan = build_rename_plan(page_meta.get("deep_files"),
+                                          page_meta.get("dir_nodes"),
+                                          items=items)
+                if not _plan:
+                    result["rename"] = {"ok": True, "total": 0,
+                                        "changed": 0, "failed": 0, "items": []}
+                    log("  ✏️ 无需重命名（名称已规范）")
+                else:
+                    log(f"  ✏️ 重命名中：共 {len(_plan)} 项…")
+                    _res = apply_rename_plan(_acc, _plan, dry_run=False)
+                    _res["ok"] = _res["failed"] == 0
+                    result["rename"] = _res
+                    log(f"  ✏️ 重命名完成：成功 {_res['changed']} · "
+                        f"失败 {_res['failed']}")
+
         series = raw_name or "影视合集"
         text = build_collection_text(
             share, series or "影视合集", items,

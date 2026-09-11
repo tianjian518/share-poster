@@ -22,7 +22,12 @@ import webbrowser
 
 from flask import Flask, jsonify, request, send_file
 
-from share_poster import ShareParser, VERSION, generate
+from share_poster import (ShareParser, VERSION, generate,
+                          GuangyaAccount, CloudShareFetcher,
+                          collect_media_items, enrich_items_with_tmdb,
+                          build_rename_plan, apply_rename_plan,
+                          ensure_guangya_account, guangya_token_days_left,
+                          guangya_login_interactive)
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
@@ -55,6 +60,7 @@ def api_generate():
         width=760,
         font_size=28,
         verbose=False,
+        rename=bool(data.get("rename")),
     )
     if not res["ok"]:
         return jsonify({"ok": False, "error": res["error"]})
@@ -81,7 +87,126 @@ def api_generate():
         "primary_b64": primary_b64,
         "primary_mime": primary_mime,
         "hint": _size_hint(res.get("text")),
+        "rename": res.get("rename"),
     })
+
+
+# ---------------- 光鸭云盘账号 ----------------
+LOGIN_SESSIONS = {}        # phone -> GuangyaAccount（等待验证码的阶段）
+
+
+@app.route("/api/account/status")
+def api_account_status():
+    acc = GuangyaAccount.from_config()
+    if not acc.logged_in:
+        return jsonify({"ok": True, "logged_in": False})
+    name, days = "", guangya_token_days_left(acc)
+    try:
+        info = acc.user_info()
+        d = info.get("data") or info
+        name = d.get("nickname") or d.get("name") or d.get("phone") or ""
+    except Exception:                                  # noqa: BLE001
+        pass
+    return jsonify({"ok": True, "logged_in": True, "name": str(name),
+                    "days": round(days, 1) if days is not None else None})
+
+
+@app.route("/api/account/login/sms", methods=["POST"])
+def api_account_login_sms():
+    """第一步：发短信验证码"""
+    data = request.get_json(force=True, silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    if not phone:
+        return jsonify({"ok": False, "error": "请填手机号（含区号，如 +86 13800138000）"})
+    acc = GuangyaAccount()
+    try:
+        acc.login_sms(phone, get_code=lambda _v: (data.get("code") or "").strip())
+    except Exception as e:                             # noqa: BLE001
+        return jsonify({"ok": False, "error": f"登录失败：{e}"})
+    acc.save_to_config()
+    name = ""
+    try:
+        info = acc.user_info()
+        d = info.get("data") or info
+        name = d.get("nickname") or d.get("name") or d.get("phone") or ""
+    except Exception:                                  # noqa: BLE001
+        pass
+    return jsonify({"ok": True, "logged_in": True, "name": str(name)})
+
+
+@app.route("/api/account/login/token", methods=["POST"])
+def api_account_login_token():
+    """手动贴 access_token / refresh_token"""
+    data = request.get_json(force=True, silent=True) or {}
+    token = (data.get("access_token") or "").strip()
+    refresh = (data.get("refresh_token") or "").strip()
+    if not token and not refresh:
+        return jsonify({"ok": False, "error": "请填 access_token（或 refresh_token）"})
+    acc = GuangyaAccount(access_token=token, refresh_token=refresh)
+    if not acc.token and acc.refresh_token_value:
+        try:
+            acc.refresh_token()
+        except Exception as e:                         # noqa: BLE001
+            return jsonify({"ok": False, "error": f"用 refresh_token 换取失败：{e}"})
+    name, warn = "", ""
+    try:
+        info = acc.user_info()
+        d = info.get("data") or info
+        name = d.get("nickname") or d.get("name") or d.get("phone") or ""
+    except Exception as e:                             # noqa: BLE001
+        warn = f"（token 可能无效：{e}）"
+    acc.save_to_config()
+    return jsonify({"ok": True, "logged_in": True, "name": str(name), "warn": warn})
+
+
+@app.route("/api/account/logout", methods=["POST"])
+def api_account_logout():
+    from share_poster import load_config, save_config
+    cfg = load_config()
+    cfg.pop("guangya", None)
+    save_config(cfg)
+    return jsonify({"ok": True, "logged_in": False})
+
+
+# ---------------- 重命名 ----------------
+@app.route("/api/rename/preview", methods=["POST"])
+def api_rename_preview():
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "请先粘贴分享链接"})
+    meta = CloudShareFetcher().fetch(text)
+    if not meta or not meta.get("title"):
+        return jsonify({"ok": False, "error": "读取分享页失败，无法生成重命名预览"})
+    items = collect_media_items(meta.get("deep_files"), meta.get("dir_nodes"))
+    if any(not it.get("tmdb") for it in items):
+        enrich_items_with_tmdb(items, verbose=False)
+    plan = build_rename_plan(meta.get("deep_files"), meta.get("dir_nodes"),
+                             items=items)
+    return jsonify({"ok": True, "title": meta.get("title", ""),
+                    "count": len(plan), "items": plan,
+                    "dirs": sum(1 for x in plan if x.get("is_dir"))})
+
+
+@app.route("/api/rename/apply", methods=["POST"])
+def api_rename_apply():
+    data = request.get_json(force=True, silent=True) or {}
+    plan = data.get("plan") or []
+    if not plan:
+        return jsonify({"ok": False, "error": "没有待执行的重命名项"})
+    acc = ensure_guangya_account(verbose=False)
+    if acc is None:
+        return jsonify({"ok": False, "error": "未登录光鸭云盘，请先在右上角登录"})
+    # 以 fileId 定位，服务端不信前端传来的 new（防篡改）
+    safe = [{"fileId": str(p.get("fileId")), "new": str(p.get("new") or "")}
+            for p in plan if p.get("fileId") and p.get("new")]
+    res = apply_rename_plan(acc, safe, dry_run=False)
+    return jsonify({"ok": res["failed"] == 0, "changed": res["changed"],
+                    "failed": res["failed"],
+                    "items": [{"old": a.get("old"), "new": a.get("new"),
+                               "status": a.get("status"),
+                               "error": a.get("error", "")}
+                              for a in res["items"]]})
 
 
 @app.route("/image/<key>")
@@ -172,15 +297,52 @@ PAGE = r"""<!doctype html>
   .cap.bad{background:#fef3f2;color:#c0392b;border:1px solid #f6c8c2}
   .cap.good{background:#eef7ef;color:var(--ok);border:1px solid #cbe8d2}
   .cap b{font-weight:700}
+  .acct{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--sub)}
+  .acct b{color:var(--ink);font-size:12px}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;
+    align-items:center;justify-content:center;z-index:200;padding:16px}
+  .modal.show{display:flex}
+  .modal .box{background:#fff;border-radius:14px;padding:22px;width:100%;
+    max-width:420px;box-shadow:0 8px 30px rgba(0,0,0,.2)}
+  .modal h3{font-size:16px;margin-bottom:4px}
+  .modal .hint{font-size:12px;color:var(--sub);line-height:1.8;margin-bottom:14px}
+  .modal input{width:100%;border:1px solid var(--line);border-radius:10px;
+    padding:11px 12px;font-size:14px;background:#fafbfc;outline:none;margin-bottom:10px}
+  .modal input:focus{border-color:var(--acc2)}
+  .tabs{display:flex;gap:6px;margin-bottom:16px;background:#f1f3f5;padding:4px;
+    border-radius:10px}
+  .tabs button{flex:1;border:none;background:transparent;border-radius:8px;
+    padding:8px;font-size:13px;cursor:pointer;color:var(--sub);font-weight:600}
+  .tabs button.on{background:#fff;color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .modal .row{margin-top:6px;justify-content:flex-end;gap:8px}
+  .rlist{max-height:340px;overflow:auto;border:1px solid var(--line);
+    border-radius:10px;margin-top:12px}
+  .rlist .it{display:flex;gap:10px;padding:9px 12px;border-bottom:1px solid #f1f3f5;
+    font-size:12.5px;line-height:1.6;align-items:flex-start}
+  .rlist .it:last-child{border-bottom:none}
+  .rlist .it input{margin-top:3px;flex:0 0 auto}
+  .rlist .k{color:var(--sub)}
+  .rlist .arrow{color:var(--acc);margin:0 6px}
+  .rlist .n{color:var(--ink);font-weight:600}
+  .chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink);
+    cursor:pointer;user-select:none}
+  .chk input{width:16px;height:16px;accent-color:var(--acc)}
+  .badge.ok{background:#eef7ef;color:var(--ok)}
+  .badge.no{background:#f1f3f5;color:var(--sub)}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <div class="logo">🎬</div>
-    <div>
+    <div style="flex:1">
       <h1>影帖 · 影视分享帖生成器</h1>
       <p>粘贴网盘链接 → 自动生成发帖图文 → 一键复制去 QQ 频道粘贴</p>
+    </div>
+    <div class="acct">
+      <span id="acct_txt">光鸭未登录</span>
+      <button class="btn ghost" id="acct_btn"
+        style="padding:7px 14px;font-size:12.5px">登录光鸭</button>
     </div>
   </header>
 
@@ -192,6 +354,14 @@ PAGE = r"""<!doctype html>
     <div class="opts">
       <input id="quality" placeholder="质量覆盖（选填）如 2160P REMUX HEVC">
       <input id="size" placeholder="大小覆盖（选填）如 40.5GB">
+    </div>
+    <div class="row" style="margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)">
+      <label class="chk" title="把分享里的文件夹和视频改成 Emby 能识别的规范名">
+        <input type="checkbox" id="do_rename">
+        <span>发帖前先重命名（规范片名 + 画质 + TMDB ID，方便他人转存后入库）</span>
+      </label>
+      <button class="btn ghost" id="preview_rename"
+        style="padding:8px 16px;font-size:13px">👀 预览重命名</button>
     </div>
     <div class="row">
       <span class="tips">画质/大小留空则按分享体积自动推断</span>
@@ -212,6 +382,13 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div id="result" class="hidden">
+    <div class="card hidden" id="rename_report">
+      <div class="row" style="margin-top:0">
+        <label id="rename_title" style="margin:0;font-size:14px;font-weight:600;color:var(--ink)"></label>
+      </div>
+      <div class="rlist" id="rename_list"></div>
+    </div>
+
     <div class="card">
       <div class="row" style="margin-top:0">
         <label id="title_line" style="margin:0;font-size:14px;font-weight:600;color:var(--ink)"></label>
@@ -240,6 +417,47 @@ PAGE = r"""<!doctype html>
   <footer>生成结果仅保存在本机。海报/封面压缩到 500KB 以内，复制图片功能依赖浏览器 Clipboard API（localhost / HTTPS 安全上下文）。</footer>
 </div>
 
+<div class="modal" id="login_modal">
+  <div class="box">
+    <h3>登录光鸭云盘</h3>
+    <div class="hint">登录后才能对你自己网盘里的文件重命名。登录态保存在本机，不会上传。</div>
+    <div class="tabs">
+      <button class="on" data-tab="sms">短信验证码</button>
+      <button data-tab="token">粘贴 Token</button>
+    </div>
+
+    <div id="tab_sms">
+      <input id="lg_phone" placeholder="手机号（含区号，如 +86 13800138000）">
+      <input id="lg_code" placeholder="收到的 6 位验证码">
+      <div class="row">
+        <button class="btn ghost" id="lg_cancel">取消</button>
+        <button class="btn primary" id="lg_sms_go">登录</button>
+      </div>
+    </div>
+
+    <div id="tab_token" class="hidden">
+      <input id="lg_token" placeholder="access_token">
+      <input id="lg_refresh" placeholder="refresh_token（选填，填了能自动续期）">
+      <div class="row">
+        <button class="btn ghost" id="lg_cancel2">取消</button>
+        <button class="btn primary" id="lg_token_go">保存登录态</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="rename_modal">
+  <div class="box" style="max-width:640px">
+    <h3 id="rm_title">重命名预览</h3>
+    <div class="hint" id="rm_sub">勾选要改的项目，确认后才会真正修改云端文件。</div>
+    <div class="rlist" id="rm_list"></div>
+    <div class="row">
+      <button class="btn ghost" id="rm_cancel">取消</button>
+      <button class="btn primary" id="rm_apply">✅ 确认重命名</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -259,7 +477,8 @@ $('#go').onclick = async () => {
   $('#result').classList.add('hidden');
   try{
     const resp = await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text, quality:$('#quality').value, size:$('#size').value, mode:curMode})});
+      body:JSON.stringify({text, quality:$('#quality').value, size:$('#size').value,
+        mode:curMode, rename:$('#do_rename').checked})});
     const d = await resp.json();
     if(!d.ok){toast(d.error||'生成失败');return;}
     curMode = d.mode;
@@ -285,6 +504,7 @@ $('#go').onclick = async () => {
       copyBtn.textContent = canShareFiles() ? '🖼 复制海报' : '⬇ 保存海报';
     }else copyBtn.textContent = '图片';
 
+    showRenameReport(d.rename);
     $('#result').classList.remove('hidden');
     $('#result').scrollIntoView({behavior:'smooth'});
   }catch(e){toast('请求失败：'+e);}
@@ -390,6 +610,170 @@ function flash(btn,msg,err){
 }
 
 $('#in').value = ''; // 保持清爽
+
+/* ==================== 光鸭云盘账号 ==================== */
+let ACCOUNT = {logged_in:false};
+
+async function refreshAccount(){
+  try{
+    const d = await (await fetch('/api/account/status')).json();
+    ACCOUNT = d;
+    if(d.logged_in){
+      $('#acct_txt').textContent = '光鸭：' + (d.name || '已登录') +
+        (d.days!==null && d.days!==undefined ? ('（token ' + d.days + ' 天）') : '');
+      $('#acct_btn').textContent = '退出登录';
+    }else{
+      $('#acct_txt').textContent = '光鸭未登录';
+      $('#acct_btn').textContent = '登录光鸭';
+    }
+  }catch(e){}
+  return ACCOUNT;
+}
+
+$('#acct_btn').onclick = async () => {
+  if(ACCOUNT.logged_in){
+    await fetch('/api/account/logout',{method:'POST'});
+    await refreshAccount();
+    toast('已退出光鸭登录');
+    return;
+  }
+  $('#login_modal').classList.add('show');
+};
+$('#lg_cancel').onclick = () => $('#login_modal').classList.remove('show');
+$('#lg_cancel2').onclick = () => $('#login_modal').classList.remove('show');
+$('#login_modal').onclick = e => { if(e.target.id === 'login_modal') e.currentTarget.classList.remove('show'); };
+
+document.querySelectorAll('.tabs button').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('.tabs button').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    const t = b.dataset.tab;
+    $('#tab_sms').classList.toggle('hidden', t !== 'sms');
+    $('#tab_token').classList.toggle('hidden', t !== 'token');
+  };
+});
+
+$('#lg_sms_go').onclick = async () => {
+  const phone = $('#lg_phone').value.trim();
+  const code  = $('#lg_code').value.trim();
+  if(!phone){ toast('请填手机号'); return; }
+  if(!code){ toast('请填收到的验证码（先去光鸭 App/短信取）'); return; }
+  $('#lg_sms_go').disabled = true;
+  toast('正在登录…');
+  try{
+    const d = await (await fetch('/api/account/login/sms',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({phone, code})})).json();
+    if(!d.ok){ toast(d.error || '登录失败'); return; }
+    $('#login_modal').classList.remove('show');
+    await refreshAccount();
+    toast('✅ 登录成功，可以重命名啦');
+  }catch(e){ toast('请求失败：' + e); }
+  finally{ $('#lg_sms_go').disabled = false; }
+};
+
+$('#lg_token_go').onclick = async () => {
+  const tk = $('#lg_token').value.trim();
+  const rf = $('#lg_refresh').value.trim();
+  if(!tk && !rf){ toast('请填 access_token 或 refresh_token'); return; }
+  $('#lg_token_go').disabled = true;
+  try{
+    const d = await (await fetch('/api/account/login/token',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({access_token:tk, refresh_token:rf})})).json();
+    if(!d.ok){ toast(d.error || '登录失败'); return; }
+    if(d.warn) toast(d.warn);
+    else{
+      $('#login_modal').classList.remove('show');
+      await refreshAccount();
+      toast('✅ 登录态已保存');
+    }
+  }catch(e){ toast('请求失败：' + e); }
+  finally{ $('#lg_token_go').disabled = false; }
+};
+
+/* ==================== 重命名 ==================== */
+let RENAME_PLAN = [];
+
+function renderPlan(items, container, selectable){
+  container.innerHTML = '';
+  items.forEach((p, i) => {
+    const d = document.createElement('div');
+    d.className = 'it';
+    const kind = p.is_dir ? '📁' : '🎞';
+    d.innerHTML = (selectable ? '<input type="checkbox" checked data-i="'+i+'">' : '') +
+      '<div style="flex:1"><span class="k">' + kind + ' ' + esc(p.old) + '</span>' +
+      '<span class="arrow">→</span><span class="n">' + esc(p.new) + '</span></div>';
+    container.appendChild(d);
+  });
+}
+function esc(t){ const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
+
+$('#preview_rename').onclick = async () => {
+  const text = $('#in').value.trim();
+  if(!text){ toast('请先粘贴分享链接'); return; }
+  $('#preview_rename').disabled = true;
+  $('#loading').classList.remove('hidden');
+  try{
+    const d = await (await fetch('/api/rename/preview',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})})).json();
+    if(!d.ok){ toast(d.error || '预览失败'); return; }
+    if(!d.count){ toast('没有需要重命名的项目（名称已规范）'); return; }
+    RENAME_PLAN = d.items;
+    $('#rm_title').textContent = '重命名预览 · 共 ' + d.count + ' 项';
+    $('#rm_sub').innerHTML = esc(d.title) + ' —— 共 ' + d.count +
+      ' 项（📁 文件夹 ' + d.dirs + ' · 🎞 文件 ' + (d.count - d.dirs) + '）。' +
+      '<br><b>确认后才会真正修改你网盘里的文件</b>，取消则不做任何改动。';
+    renderPlan(RENAME_PLAN, $('#rm_list'), true);
+    $('#rename_modal').classList.add('show');
+  }catch(e){ toast('请求失败：' + e); }
+  finally{ $('#preview_rename').disabled = false; $('#loading').classList.add('hidden'); }
+};
+
+$('#rm_cancel').onclick = () => $('#rename_modal').classList.remove('show');
+$('#rename_modal').onclick = e => { if(e.target.id === 'rename_modal') e.currentTarget.classList.remove('show'); };
+
+$('#rm_apply').onclick = async () => {
+  const picked = [];
+  $('#rm_list').querySelectorAll('input[type=checkbox]').forEach(c => {
+    if(c.checked) picked.push(RENAME_PLAN[+c.dataset.i]);
+  });
+  if(!picked.length){ toast('没有勾选任何项目'); return; }
+  if(!ACCOUNT.logged_in){
+    const a = await refreshAccount();
+    if(!a.logged_in){ toast('请先登录光鸭云盘'); $('#login_modal').classList.add('show'); return; }
+  }
+  if(!confirm('确定要重命名这 ' + picked.length + ' 项吗？\n此操作会直接修改你网盘里的文件。')) return;
+  $('#rm_apply').disabled = true;
+  $('#rm_apply').textContent = '⏳ 正在重命名…';
+  try{
+    const d = await (await fetch('/api/rename/apply',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({plan:picked})})).json();
+    if(!d.ok && d.error){ toast(d.error); return; }
+    $('#rm_title').textContent = '重命名完成 · 成功 ' + d.changed + ' · 失败 ' + d.failed;
+    $('#rm_sub').innerHTML = d.failed ? '<b style="color:#c0392b">部分失败，见下方标注。</b>'
+                                      : '全部改好了 ✅ 现在可以直接生成帖子。';
+    renderPlan(d.items, $('#rm_list'), false);
+    $('#rm_apply').textContent = '✅ 已完成';
+    toast('重命名完成：成功 ' + d.changed + '，失败 ' + d.failed);
+    $('#do_rename').checked = false;   // 已手动改过，生成时不必再改
+  }catch(e){ toast('请求失败：' + e); }
+  finally{ $('#rm_apply').disabled = false; }
+};
+
+/* 生成结果里的重命名报告 */
+function showRenameReport(r){
+  const box = $('#rename_report');
+  if(!r){ box.classList.add('hidden'); return; }
+  if(r.error){ box.classList.add('hidden'); toast(r.error); return; }
+  $('#rename_title').textContent = '✏️ 重命名完成 · 成功 ' + r.changed +
+    ' · 失败 ' + (r.failed || 0);
+  renderPlan(r.items || [], $('#rename_list'), false);
+  box.classList.remove('hidden');
+}
+
+refreshAccount();
 
 /* 移动端判断：用于能力提示与按钮文案 */
 const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);

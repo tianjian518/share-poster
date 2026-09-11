@@ -105,6 +105,15 @@ python3 share_poster.py
 | `--image-width` / `--font-size` | 长图尺寸 / 字号 |
 | `--no-net` | 关闭分享页 / TMDB 网页抓取 |
 | `--save-config` | 保存 Key 到 `~/.share_poster.json` |
+| `--login-guangya` | 短信验证码登录光鸭云盘 |
+| `--login-token` | 直接贴 access_token 登录 |
+| `--refresh-token` | 贴 refresh_token（可单独用，自动换 access_token） |
+| `--guangya-status` | 查看光鸭云盘登录状态 |
+| `--logout-guangya` | 退出光鸭云盘登录 |
+| `--rename` | 发帖前重命名分享内的文件夹与视频 |
+| `--rename-dry-run` | 只预览重命名，不改动 |
+| `--rename-limit N` | 只处理前 N 项（分批执行） |
+| `--show-rename-plan` | 生成帖子前先打印重命名预览 |
 
 ## 输出
 
@@ -124,6 +133,84 @@ python3 share_poster.py
 只要最终返回 `{cloud, url, title, size_bytes, file_count}` 结构即可被主流程自动消费。
 
 ---
+
+## ✨ 光鸭云盘账号 & 发帖前重命名（v1.1.0 新增）
+
+发帖之前，可以先把分享里乱糟糟的文件夹名/文件名改成**规范名**，
+别人转存后 Emby / Jellyfin 能直接刮削，识别率更高。
+
+**规范格式（文件夹和视频文件都改）：**
+
+```
+文件夹: 片名 (年份) [画质] {tmdb-id}
+文件:   片名 (年份) [画质] {tmdb-id}.mkv
+```
+
+实际效果（詹妮弗·康纳利合集，71 项）：
+
+```
+📁 A-爱的秘密(1997)  →  爱的秘密 (1997) [1080P H.264 WEBRip] {tmdb-12723}
+🎞 爱的秘密.mkv       →  爱的秘密 (1997) [1080P H.264 WEBRip] {tmdb-12723}.mkv
+```
+
+### 一、登录光鸭云盘（两种方式都支持）
+
+**方式 1 · 短信验证码**（网页右上角「登录光鸭」）
+
+```bash
+python3 share_poster.py --login-guangya
+```
+
+**方式 2 · 直接贴 Token**
+
+```bash
+# access_token + refresh_token（推荐，能自动续期）
+python3 share_poster.py --login-token "你的access_token" --refresh-token "你的refresh_token"
+
+# 只有 refresh_token 也行，会自动换出 access_token
+python3 share_poster.py --refresh-token "你的refresh_token"
+```
+
+登录态保存在 `~/.share_poster.json`，**token 快过期时执行任务会自动续期**。
+
+```bash
+python3 share_poster.py --guangya-status     # 看登录状态和剩余天数
+python3 share_poster.py --logout-guangya     # 退出登录
+```
+
+### 二、重命名
+
+```bash
+# 只预览，不改任何东西
+python3 share_poster.py --rename-dry-run "分享链接"
+
+# 真改
+python3 share_poster.py --rename "分享链接"
+
+# 分批改（先改前 20 项，确认没问题再继续）
+python3 share_poster.py --rename --rename-limit 20 "分享链接"
+
+# 重命名完顺便出帖子
+python3 share_poster.py --rename "分享链接" -o ./out
+```
+
+**网页版更方便**：粘贴链接 → 点「👀 预览重命名」→ 弹窗里逐项勾选 → 「✅ 确认重命名」。
+或者勾上下方的「发帖前先重命名」，点「生成帖子」时会自动改名再出帖。
+
+> ⚠️ 重命名是**直接改你自己网盘里的文件**，不可撤销。所以默认只预览，
+> 必须手动确认（弹窗里勾选 + 二次确认）才会真正执行。
+
+## v1.1.0 (2026-09-11)
+
+- 新增**光鸭云盘账号登录**：短信验证码 + 手动贴 Token，两种都支持
+- 登录态本地保存，token 将过期时自动续期
+- 新增**发帖前重命名**：文件夹 + 视频文件统一改成
+  `片名 (年份) [画质] {tmdb-id}`（Emby 友好，他人转存即可入库）
+- 重命名**默认只预览**，弹窗勾选 + 二次确认后才真正修改
+- 网页右上角显示登录状态与 token 剩余天数
+- CLI 新增 `--login-guangya` / `--login-token` / `--refresh-token` /
+  `--guangya-status` / `--logout-guangya` / `--rename` / `--rename-dry-run` /
+  `--rename-limit` / `--show-rename-plan`
 
 ## v1.0.7 (2026-09-11)
 
